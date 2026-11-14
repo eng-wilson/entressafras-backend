@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -8,9 +10,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.services.power_client import PowerClient
-from app.services.smap_client import SmapClient, buscar_ee
+from app.services.smap_client import SmapClient, SmapIndisponivel, buscar_ee, inicializar_ee
 
 settings = get_settings()
+log = logging.getLogger(__name__)
+
+
+async def _checar_earth_engine() -> str:
+    """Autentica no start para o erro aparecer no log do deploy, não na 1ª requisição."""
+    if not settings.ee_configurado:
+        return "nao_configurado"
+    try:
+        await asyncio.to_thread(
+            inicializar_ee,
+            settings.ee_project,
+            settings.ee_service_account_key,
+            settings.ee_service_account_json,
+        )
+    except SmapIndisponivel as exc:
+        log.error("Earth Engine indisponível; SMAP só a partir de semente/cache: %s", exc)
+        return "erro"
+    return "ok"
 
 
 @asynccontextmanager
@@ -22,14 +42,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             seed_dir=settings.power_seed_dir,
             cache_dir=settings.power_cache_dir,
         )
-        ee_configurado = bool(settings.ee_project or settings.ee_service_account_key)
+        app.state.ee_status = await _checar_earth_engine()
         app.state.smap_client = SmapClient(
             seed_dir=settings.smap_seed_dir,
             cache_dir=settings.smap_cache_dir,
             buscar=buscar_ee(
-                settings.smap_asset, settings.ee_project, settings.ee_service_account_key
+                settings.smap_asset,
+                settings.ee_project,
+                settings.ee_service_account_key,
+                settings.ee_service_account_json,
             )
-            if ee_configurado
+            if settings.ee_configurado
             else None,
         )
         yield

@@ -199,3 +199,74 @@ def test_fatias_mensais() -> None:
     assert [(a.month, b.month, b.day) for a, b in fatias] == [
         (9, 10, 1), (10, 11, 1), (11, 12, 1), (12, 1, 1), (1, 1, 15)
     ]
+
+
+# --- Autenticação ------------------------------------------------------------------------------
+
+CHAVE = {
+    "type": "service_account",
+    "project_id": "projeto-da-chave",
+    "client_email": "conta@projeto-da-chave.iam.gserviceaccount.com",
+    "private_key": "-----BEGIN PRIVATE KEY-----\nSEGREDO\n-----END PRIVATE KEY-----\n",
+}
+
+
+@pytest.fixture
+def ee_falso(monkeypatch) -> dict:
+    """Troca ServiceAccountCredentials/Initialize por registradores e zera o estado global."""
+    chamadas: dict = {}
+
+    def credenciais(email, key_file=None, key_data=None):
+        chamadas["credenciais"] = (email, key_file, key_data)
+        return "creds"
+
+    def initialize(creds=None, project=None):
+        chamadas["initialize"] = (creds, project)
+
+    monkeypatch.setattr(ee, "ServiceAccountCredentials", credenciais)
+    monkeypatch.setattr(ee, "Initialize", initialize)
+    monkeypatch.setattr(sc, "_ee_pronto", False)
+    return chamadas
+
+
+def test_chave_json_puro(ee_falso) -> None:
+    sc.inicializar_ee(None, chave_json=json.dumps(CHAVE))
+    email, arquivo, dados = ee_falso["credenciais"]
+    assert email == CHAVE["client_email"] and arquivo is None
+    assert json.loads(dados) == CHAVE
+    assert ee_falso["initialize"] == ("creds", "projeto-da-chave")  # project_id da chave
+
+
+def test_chave_base64_com_projeto_explicito(ee_falso) -> None:
+    import base64
+
+    b64 = base64.b64encode(json.dumps(CHAVE).encode()).decode()
+    sc.inicializar_ee("tcc2-e909a", chave_json=f"  {b64}\n")
+    assert ee_falso["initialize"] == ("creds", "tcc2-e909a")
+
+
+def test_chave_json_tem_prioridade_sobre_arquivo(ee_falso, tmp_path: Path) -> None:
+    arquivo = tmp_path / "outra.json"
+    arquivo.write_text(json.dumps({**CHAVE, "client_email": "arquivo@x.com"}))
+    sc.inicializar_ee(None, chave_arquivo=arquivo, chave_json=json.dumps(CHAVE))
+    assert ee_falso["credenciais"][0] == CHAVE["client_email"]
+
+
+@pytest.mark.parametrize(
+    "valor",
+    ["não é base64 SEGREDO", "eyJzZWdyZWRvIjog", json.dumps({"private_key": "SEGREDO"})],
+)
+def test_chave_invalida_nao_vaza_valor(ee_falso, valor: str) -> None:
+    with pytest.raises(SmapIndisponivel) as exc:
+        sc.inicializar_ee(None, chave_json=valor)
+    assert "SEGREDO" not in str(exc.value) and valor not in str(exc.value)
+    assert "initialize" not in ee_falso
+    assert sc._ee_pronto is False
+
+
+def test_sem_chave_usa_credencial_de_usuario(ee_falso) -> None:
+    sc.inicializar_ee("tcc2-e909a")
+    assert "credenciais" not in ee_falso
+    assert ee_falso["initialize"] == (None, "tcc2-e909a")
+    sc.inicializar_ee("outro")  # já inicializado: não repete
+    assert ee_falso["initialize"] == (None, "tcc2-e909a")

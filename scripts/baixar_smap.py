@@ -1,7 +1,7 @@
 """Pré-baixa a umidade do solo SMAP L4 (Earth Engine) de um ponto para app/data/smap/ (semente).
 
 Precisa de EE_PROJECT (projeto Cloud registrado no Earth Engine) no .env ou no ambiente, e de
-credencial: `earthengine authenticate` ou EE_SERVICE_ACCOUNT_KEY.
+credencial: `earthengine authenticate`, EE_SERVICE_ACCOUNT_KEY ou EE_SERVICE_ACCOUNT_JSON.
 
 Uso: uv run python -m scripts.baixar_smap [lat lon]   (padrão: Sorriso-MT, -12.55 -55.72)
 """
@@ -19,14 +19,19 @@ SORRISO = (-12.55, -55.72)
 
 async def main(lat: float, lon: float) -> None:
     settings = get_settings()
-    if not (settings.ee_project or settings.ee_service_account_key):
-        sys.exit("defina EE_PROJECT (e, no servidor, EE_SERVICE_ACCOUNT_KEY)")
+    if not settings.ee_configurado:
+        sys.exit("defina EE_PROJECT (e, no servidor, EE_SERVICE_ACCOUNT_JSON)")
     janela = janela_safras()
     print(f"SMAP {lat}, {lon} → pixel {pixel(lat, lon)} · {janela.inicio} a {janela.fim}")
     client = SmapClient(
         seed_dir=settings.smap_seed_dir,
         cache_dir=settings.smap_cache_dir,
-        buscar=buscar_ee(settings.smap_asset, settings.ee_project, settings.ee_service_account_key),
+        buscar=buscar_ee(
+            settings.smap_asset,
+            settings.ee_project,
+            settings.ee_service_account_key,
+            settings.ee_service_account_json,
+        ),
     )
     chave, bruto = await client.bruto(lat, lon, janela)
     destino = settings.smap_seed_dir / chave

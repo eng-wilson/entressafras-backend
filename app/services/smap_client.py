@@ -11,6 +11,7 @@ alinhados aos do NASA POWER (que usa a hora solar local). Ordem de leitura: seme
 """
 
 import asyncio
+import base64
 import json
 import logging
 import threading
@@ -135,27 +136,67 @@ _ee_lock = threading.Lock()
 _ee_pronto = False
 
 
-def inicializar_ee(project: str | None, chave_conta_servico: Path | None) -> None:
-    """Inicializa o Earth Engine uma vez por processo."""
+def _ler_chave_json(valor: str) -> dict:
+    """Chave da conta de serviço em JSON puro ou base64. Erros nunca incluem o valor."""
+    texto = valor.strip()
+    if not texto.startswith("{"):
+        try:
+            texto = base64.b64decode(texto, validate=True).decode("utf-8")
+        except ValueError:  # inclui binascii.Error, não-ASCII e UnicodeDecodeError
+            raise SmapIndisponivel(
+                "EE_SERVICE_ACCOUNT_JSON não é JSON nem base64 válido"
+            ) from None
+    try:
+        info = json.loads(texto)
+    except json.JSONDecodeError:
+        raise SmapIndisponivel("EE_SERVICE_ACCOUNT_JSON não contém um JSON válido") from None
+    if not isinstance(info, dict) or not {"client_email", "private_key"} <= info.keys():
+        raise SmapIndisponivel(
+            "EE_SERVICE_ACCOUNT_JSON sem client_email/private_key (é a chave da conta de serviço?)"
+        )
+    return info
+
+
+def inicializar_ee(
+    project: str | None,
+    chave_arquivo: Path | None = None,
+    chave_json: str | None = None,
+) -> None:
+    """Inicializa o Earth Engine uma vez por processo.
+
+    Ordem: chave em texto (`EE_SERVICE_ACCOUNT_JSON`, servidor) → arquivo de chave
+    (`EE_SERVICE_ACCOUNT_KEY`) → credencial de usuário (`earthengine authenticate`, em dev).
+    """
     global _ee_pronto
     with _ee_lock:
         if _ee_pronto:
             return
         import ee
 
+        if chave_json:
+            info = _ler_chave_json(chave_json)
+        elif chave_arquivo:
+            try:
+                info = json.loads(chave_arquivo.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise SmapIndisponivel(f"arquivo de chave ilegível: {chave_arquivo}") from exc
+        else:
+            info = None
+
         try:
-            if chave_conta_servico:
-                info = json.loads(chave_conta_servico.read_text(encoding="utf-8"))
+            if info:
                 creds = ee.ServiceAccountCredentials(
-                    info["client_email"], key_file=str(chave_conta_servico)
+                    info["client_email"], key_data=json.dumps(info)
                 )
                 project = project or info.get("project_id")
+                metodo = f"conta de serviço {info['client_email']}"
                 ee.Initialize(creds, project=project)
             else:
+                metodo = "credencial de usuário"
                 ee.Initialize(project=project)
-        except Exception as exc:  # credencial ausente/inválida, projeto não registrado
+        except Exception as exc:  # credencial inválida, projeto não registrado, sem permissão
             raise SmapIndisponivel(f"Earth Engine não inicializou: {exc}") from exc
-        log.info("Earth Engine inicializado (projeto %s)", project)
+        log.info("Earth Engine inicializado (%s, projeto %s)", metodo, project)
         _ee_pronto = True
 
 
@@ -219,13 +260,14 @@ def fatias_mensais(t0: datetime, t1: datetime) -> list[tuple[datetime, datetime]
 def buscar_ee(
     asset: str,
     project: str | None,
-    chave_conta_servico: Path | None,
+    chave_arquivo: Path | None = None,
+    chave_json: str | None = None,
     backoff_s: Sequence[float] = BACKOFF_S,
 ) -> Buscar:
     """Função que baixa do Earth Engine a série diária do ponto entre `inicio` e `fim`."""
 
     def buscar(lat: float, lon: float, inicio: date, fim: date) -> dict:
-        inicializar_ee(project, chave_conta_servico)
+        inicializar_ee(project, chave_arquivo, chave_json)
         import ee
 
         col = ee.ImageCollection(asset).select(list(CAMPOS_SMAP))

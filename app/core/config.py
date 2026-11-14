@@ -28,14 +28,24 @@ class Settings(BaseSettings):
     ee_project: str | None = None
     # JSON da conta de serviço registrada no Earth Engine; sem ele, usa `earthengine authenticate`.
     ee_service_account_key: Path | None = None
+    # A mesma chave como texto (JSON puro ou base64): para servidores sem arquivo, como o Railway.
+    ee_service_account_json: str | None = None
     smap_asset: str = "NASA/SMAP/SPL4SMGP/008"
     smap_seed_dir: Path = APP_DIR / "data" / "smap"
     smap_cache_dir: Path = PROJECT_DIR / ".cache" / "smap"
 
-    @field_validator("ee_project", "ee_service_account_key", mode="before")
+    @field_validator(
+        "ee_project", "ee_service_account_key", "ee_service_account_json", mode="before"
+    )
     @classmethod
     def _vazio_e_none(cls, v: object) -> object:
         return None if isinstance(v, str) and not v.strip() else v
+
+    @property
+    def ee_configurado(self) -> bool:
+        return bool(
+            self.ee_project or self.ee_service_account_key or self.ee_service_account_json
+        )
 
 
 @lru_cache
