@@ -1,15 +1,17 @@
 """Rotas de clima contra a semente de Sorriso (app/data/power), sem rede."""
 
-from datetime import date
+import json
+from datetime import date, timedelta
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.routes.clima import get_power_client
+from app.api.routes.clima import get_power_client, get_smap_client
 from app.core.config import get_settings
 from app.main import app
 from app.services import power_client as pc
+from app.services import smap_client as sc
 
 SORRISO = {"lat": -12.55, "lon": -55.72}
 HOJE = date(2026, 11, 14)  # a semente cobre 2016/17–2025/26
@@ -31,8 +33,24 @@ def client(tmp_path, monkeypatch) -> TestClient:
         cache_dir=tmp_path,
     )
     app.dependency_overrides[get_power_client] = lambda: power
+    app.dependency_overrides[get_smap_client] = lambda: None
     yield TestClient(app)
     app.dependency_overrides.clear()
+
+
+def _semente_smap(pasta, inicio: date, fim: date) -> None:
+    """Semente SMAP sintética: zona das raízes 0,30 m³/m³ em todos os dias da janela."""
+    n = (fim - inicio).days + 1
+    bruto = {
+        "pixel": {"lat": -12.6, "lon": -55.7},
+        "bandas": ["sm_surface", "sm_rootzone", "sm_rootzone_wetness", "sm_rootzone_pctl"],
+        "dias": {
+            f"{inicio + timedelta(days=i):%Y-%m-%d}": [0.25, 0.30, 0.6, 50.0] for i in range(n)
+        },
+    }
+    arquivo = pasta / sc.chave_cache(*sc.pixel(**SORRISO), inicio, fim)
+    arquivo.parent.mkdir(parents=True, exist_ok=True)
+    arquivo.write_text(json.dumps(bruto))
 
 
 def test_decendios_sorriso(client: TestClient) -> None:
@@ -59,6 +77,36 @@ def test_decendios_sorriso(client: TestClient) -> None:
         assert d["tmax_media"] <= d["tmax_extremo_medio"] <= d["tmax_absoluto"]
         assert 20 < d["et0_media"] < 70  # 2–7 mm/dia
         assert 0 <= d["gwetroot_media"] <= 1
+        assert d["sm_rootzone_media"] is None  # sem SMAP configurado
+    assert body["pixel_smap"] is None and body["fonte_umidade_solo"] is None
+
+
+def test_decendios_com_umidade_smap(client: TestClient, tmp_path) -> None:
+    janela = pc.janela_safras(HOJE)
+    _semente_smap(tmp_path / "smap", janela.inicio, janela.fim)
+    smap = sc.SmapClient(seed_dir=tmp_path / "smap", cache_dir=tmp_path / "x", buscar=None)
+    app.dependency_overrides[get_smap_client] = lambda: smap
+    body = client.get("/api/clima/decendios", params=SORRISO).json()
+    assert body["pixel_smap"] == {"lat": -12.6, "lon": -55.7}
+    assert "SMAP" in body["fonte_umidade_solo"]
+    for d in body["decendios"]:
+        assert d["sm_rootzone_media"] == 0.3 and d["sm_surface_media"] == 0.25
+        assert d["sm_rootzone_wetness_media"] == 0.6 and d["sm_rootzone_pctl_media"] == 50.0
+        assert d["chuva_media"] is not None  # POWER continua junto
+
+
+def test_decendios_smap_falhando_nao_derruba(client: TestClient, tmp_path) -> None:
+    def falha(*args):
+        raise sc.SmapIndisponivel("Earth Engine fora")
+
+    smap = sc.SmapClient(seed_dir=tmp_path / "s", cache_dir=tmp_path / "c", buscar=falha)
+    app.dependency_overrides[get_smap_client] = lambda: smap
+    resp = client.get("/api/clima/decendios", params=SORRISO)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["pixel_smap"] is None
+    assert all(d["sm_rootzone_media"] is None for d in body["decendios"])
+    assert all(d["chuva_media"] is not None for d in body["decendios"])
 
 
 def test_diario_recorte(client: TestClient) -> None:
@@ -95,6 +143,7 @@ def test_power_indisponivel_503(tmp_path) -> None:
         backoff_s=(0.0,),
     )
     app.dependency_overrides[get_power_client] = lambda: power
+    app.dependency_overrides[get_smap_client] = lambda: None
     try:
         resp = TestClient(app).get("/api/clima/decendios", params={"lat": 10, "lon": 10})
     finally:

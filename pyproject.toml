@@ -5,8 +5,10 @@ description = "Entressafras backend (FastAPI)"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "earthengine-api>=1.7.52",
     "fastapi[standard]>=0.162.7",
     "httpx>=0.28.1",
+    "pandas>=3.1.1",
     "pydantic-settings>=2.16.3",
 ]
 

@@ -28,3 +28,18 @@ Respostas JSON brutas da API diária por ponto do [NASA POWER](https://power.lar
 
 Os dados são públicos. Cite: "These data were obtained from the NASA Langley Research Center (LaRC)
 POWER Project funded through the NASA Earth Science/Applied Science Program."
+
+# Dados: SMAP L4 (`smap/`)
+
+Umidade do solo diária do [SMAP L4 v8](https://developers.google.com/earth-engine/datasets/catalog/NASA_SMAP_SPL4SMGP_008)
+(`NASA/SMAP/SPL4SMGP/008`, Google Earth Engine), salva por `scripts/baixar_smap.py`. Nome:
+`smap_v1_<lat>_<lon>_<inicio>_<fim>.json` (centro da célula de 0,1° e a janela de safras).
+
+- Formato: `{"pixel": {lat, lon}, "bandas": [...], "dias": {"AAAA-MM-DD": [valores]}}`.
+- Bandas: `sm_surface` (0–5 cm) e `sm_rootzone` (0–100 cm) em m³/m³, `sm_rootzone_wetness` (fração
+  0–1) e `sm_rootzone_pctl` (percentil 0–100). `null` = mascarado.
+- Média das 8 amostras de 3 h no fuso America/Cuiaba; dias com menos de 7 amostras são descartados.
+- É produto de modelo (GEOS Catchment) com assimilação do satélite SMAP, não observação direta.
+
+Domínio público. Cite: Reichle, R. et al. (2025). SMAP L4 Global 3-hourly 9 km EASE-Grid Surface
+and Root Zone Soil Moisture Geophysical Data, Version 8. NSIDC DAAC. doi:10.5067/T5RUATAQREF8.

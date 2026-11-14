@@ -7,6 +7,10 @@ AVISO_RESOLUCAO = (
     "não para o talhão. Talhões vizinhos caem na mesma célula."
 )
 FONTE = "NASA POWER (comunidade AG), série diária; ET0 FAO-56 Penman-Monteith"
+FONTE_SMAP = (
+    "NASA SMAP L4 (SPL4SMGP v8) via Google Earth Engine, pixel de ~11 km: modelo GEOS Catchment "
+    "com assimilação das observações do satélite SMAP; médias diárias no fuso de MT."
+)
 
 
 class Ponto(BaseModel):
@@ -37,6 +41,18 @@ class Decendio(BaseModel):
     tmax_absoluto: float | None = Field(description="Maior Tmax entre todas as safras, °C")
     gwettop_media: float | None = Field(description="Umidade do solo superficial, fração 0–1")
     gwetroot_media: float | None = Field(description="Umidade da zona das raízes, fração 0–1")
+    sm_surface_media: float | None = Field(
+        description="SMAP: umidade do solo 0–5 cm, m³/m³ (null sem SMAP)"
+    )
+    sm_rootzone_media: float | None = Field(
+        description="SMAP: umidade da zona das raízes 0–100 cm, m³/m³"
+    )
+    sm_rootzone_wetness_media: float | None = Field(
+        description="SMAP: saturação da zona das raízes, fração 0–1 (comparável a gwetroot)"
+    )
+    sm_rootzone_pctl_media: float | None = Field(
+        description="SMAP: percentil climatológico da zona das raízes, 0–100 (50 = normal)"
+    )
 
 
 class ClimaDecendios(BaseModel):
@@ -45,6 +61,10 @@ class ClimaDecendios(BaseModel):
     safras: list[str]
     fonte: str = FONTE
     aviso_resolucao: str = AVISO_RESOLUCAO
+    pixel_smap: Ponto | None = Field(
+        default=None, description="Pixel SMAP amostrado; null = umidade SMAP indisponível"
+    )
+    fonte_umidade_solo: str | None = None
     decendios: list[Decendio]
 
 

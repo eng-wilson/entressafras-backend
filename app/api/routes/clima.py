@@ -1,18 +1,37 @@
+import asyncio
+import logging
 from dataclasses import asdict
 from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from app.schemas.clima import Celula, ClimaDecendios, ClimaDiario, Decendio, Dia, Ponto
-from app.services.agro import agregar_decendios
+from app.schemas.clima import (
+    FONTE_SMAP,
+    Celula,
+    ClimaDecendios,
+    ClimaDiario,
+    Decendio,
+    Dia,
+    Ponto,
+)
+from app.services.agro import agregar_decendios, mesclar_smap
 from app.services.power_client import (
+    Janela,
     PowerClient,
     PowerIndisponivel,
     RespostaInvalida,
     SerieDiaria,
     janela_safras,
 )
+from app.services.smap_client import (
+    SerieSmap,
+    SmapClient,
+    SmapIndisponivel,
+    SmapRespostaInvalida,
+)
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/clima", tags=["clima"])
 
@@ -21,18 +40,38 @@ def get_power_client(request: Request) -> PowerClient:
     return request.app.state.power_client
 
 
+def get_smap_client(request: Request) -> SmapClient | None:
+    return getattr(request.app.state, "smap_client", None)
+
+
 Client = Annotated[PowerClient, Depends(get_power_client)]
+Smap = Annotated[SmapClient | None, Depends(get_smap_client)]
 Lat = Annotated[float, Query(ge=-90, le=90, description="Latitude, graus decimais")]
 Lon = Annotated[float, Query(ge=-180, le=180, description="Longitude, graus decimais")]
 
 
-async def _serie(client: PowerClient, lat: float, lon: float) -> SerieDiaria:
+async def _serie(
+    client: PowerClient, lat: float, lon: float, janela: Janela | None = None
+) -> SerieDiaria:
     try:
-        return await client.serie(lat, lon)
+        return await client.serie(lat, lon, janela)
     except PowerIndisponivel as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RespostaInvalida as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def _smap(
+    smap: SmapClient | None, lat: float, lon: float, janela: Janela
+) -> SerieSmap | None:
+    """Umidade SMAP; se faltar, a resposta sai sem ela em vez de falhar."""
+    if smap is None:
+        return None
+    try:
+        return await smap.serie(lat, lon, janela)
+    except (SmapIndisponivel, SmapRespostaInvalida) as exc:
+        log.warning("SMAP indisponível para %s, %s: %s", lat, lon, exc)
+        return None
 
 
 def _celula(serie: SerieDiaria) -> Celula:
@@ -40,14 +79,23 @@ def _celula(serie: SerieDiaria) -> Celula:
 
 
 @router.get("/decendios", response_model=ClimaDecendios)
-async def clima_decendios(lat: Lat, lon: Lon, client: Client) -> ClimaDecendios:
-    """Climatologia das 10 últimas safras completas (set–ago) em 36 decêndios."""
-    serie = await _serie(client, lat, lon)
+async def clima_decendios(lat: Lat, lon: Lon, client: Client, smap: Smap) -> ClimaDecendios:
+    """Climatologia das 10 últimas safras completas (set–ago) em 36 decêndios.
+
+    Inclui a umidade do solo SMAP L4 (Earth Engine) quando disponível; senão, `sm_*` = null.
+    """
+    janela = janela_safras()
+    serie, umidade = await asyncio.gather(
+        _serie(client, lat, lon, janela), _smap(smap, lat, lon, janela)
+    )
+    dias = mesclar_smap(serie.dias, umidade.dias) if umidade else serie.dias
     return ClimaDecendios(
         ponto=Ponto(lat=lat, lon=lon),
         celula=_celula(serie),
-        safras=janela_safras().safras,
-        decendios=[Decendio(**asdict(r)) for r in agregar_decendios(serie.dias)],
+        safras=janela.safras,
+        pixel_smap=Ponto(lat=umidade.lat, lon=umidade.lon) if umidade else None,
+        fonte_umidade_solo=FONTE_SMAP if umidade else None,
+        decendios=[Decendio(**asdict(r)) for r in agregar_decendios(dias)],
     )
 
 

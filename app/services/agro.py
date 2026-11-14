@@ -7,14 +7,16 @@ O 3º decêndio do mês vai do dia 21 ao último dia (8 a 11 dias).
 
 import math
 import statistics
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import date
 
 GSC = 0.0820  # constante solar, MJ/m²/min
 SIGMA = 4.903e-9  # Stefan-Boltzmann, MJ/K⁴/m²/dia
 ALBEDO = 0.23
 MIN_SAFRAS_VALIDAS = 5
+# Bandas do SMAP L4 (Earth Engine): m³/m³, m³/m³, fração 0–1, percentil 0–100.
+CAMPOS_SMAP = ("sm_surface", "sm_rootzone", "sm_rootzone_wetness", "sm_rootzone_pctl")
 MESES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
 
 
@@ -137,6 +139,18 @@ class DiaClima:
     gwetroot: float | None
     et0: float | None
     et0_metodo: str | None
+    # SMAP L4 (opcional; o POWER não traz). Ver `mesclar_smap`.
+    sm_surface: float | None = None
+    sm_rootzone: float | None = None
+    sm_rootzone_wetness: float | None = None
+    sm_rootzone_pctl: float | None = None
+
+
+def mesclar_smap(
+    dias: Sequence[DiaClima], smap: Mapping[date, Mapping[str, float | None]]
+) -> list[DiaClima]:
+    """Acrescenta a umidade SMAP do mesmo dia à série do POWER (dias sem SMAP ficam None)."""
+    return [replace(d, **smap[d.data]) if d.data in smap else d for d in dias]
 
 
 @dataclass
@@ -157,6 +171,10 @@ class ResumoDecendio:
     tmax_absoluto: float | None
     gwettop_media: float | None
     gwetroot_media: float | None
+    sm_surface_media: float | None = None
+    sm_rootzone_media: float | None = None
+    sm_rootzone_wetness_media: float | None = None
+    sm_rootzone_pctl_media: float | None = None
 
 
 def _validos(valores: Sequence[float | None]) -> list[float] | None:
@@ -182,10 +200,10 @@ def _extremo(valores: Sequence[float | None], fn: Callable[[list[float]], float]
 
 
 def _entre_safras(
-    valores: Sequence[float | None], fn: Callable[[list[float]], float]
+    valores: Sequence[float | None], fn: Callable[[list[float]], float], casas: int = 2
 ) -> float | None:
     ok = [v for v in valores if v is not None]
-    return round(fn(ok), 2) if len(ok) >= MIN_SAFRAS_VALIDAS else None
+    return round(fn(ok), casas) if len(ok) >= MIN_SAFRAS_VALIDAS else None
 
 
 def p20(valores: list[float]) -> float:
@@ -204,6 +222,7 @@ def agregar_decendios(dias: Sequence[DiaClima]) -> list[ResumoDecendio]:
         por_safra = grupos[idx]
         chuva, et0, gwettop, gwetroot = [], [], [], []
         tmin_m, tmin_x, tmax_m, tmax_x = [], [], [], []
+        smap: dict[str, list[float | None]] = {c: [] for c in CAMPOS_SMAP}
         tmin_abs: list[float] = []
         tmax_abs: list[float] = []
         preenchidos = 0
@@ -213,6 +232,8 @@ def agregar_decendios(dias: Sequence[DiaClima]) -> list[ResumoDecendio]:
             et0.append(_total(col["et0"]))
             gwettop.append(_media(col["gwettop"]))
             gwetroot.append(_media(col["gwetroot"]))
+            for c in CAMPOS_SMAP:
+                smap[c].append(_media(col[c]))
             tmin_m.append(_media(col["tmin"]))
             tmin_x.append(_extremo(col["tmin"], min))
             tmax_m.append(_media(col["tmax"]))
@@ -242,6 +263,12 @@ def agregar_decendios(dias: Sequence[DiaClima]) -> list[ResumoDecendio]:
                 tmax_absoluto=round(max(tmax_abs), 2) if ok and tmax_abs else None,
                 gwettop_media=_entre_safras(gwettop, statistics.mean),
                 gwetroot_media=_entre_safras(gwetroot, statistics.mean),
+                **{
+                    f"{c}_media": _entre_safras(
+                        smap[c], statistics.mean, casas=1 if c == "sm_rootzone_pctl" else 3
+                    )
+                    for c in CAMPOS_SMAP
+                },
             )
         )
     return resumo

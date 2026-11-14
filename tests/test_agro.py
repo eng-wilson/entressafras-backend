@@ -9,6 +9,7 @@ from app.services.agro import (
     et0_dia,
     et0_hargreaves,
     et0_penman_monteith,
+    mesclar_smap,
     p20,
     rotulo_decendio,
     safra_de,
@@ -118,3 +119,33 @@ def test_menos_da_metade_dos_dias_descarta_a_safra() -> None:
     assert res[0].chuva_media is None  # < 5 safras válidas = "Sem dado"
     assert res[0].chuva_p20 is None
     assert res[1].anos_validos == 10
+
+
+def test_mesclar_smap_por_data() -> None:
+    dias = _serie(1)[:3]
+    smap = {dias[1].data: {"sm_surface": 0.2, "sm_rootzone": 0.3,
+                           "sm_rootzone_wetness": 0.6, "sm_rootzone_pctl": 40.0}}
+    mesclados = mesclar_smap(dias, smap)
+    assert mesclados[0].sm_rootzone is None
+    assert mesclados[1].sm_rootzone == 0.3 and mesclados[1].chuva == dias[1].chuva
+    assert mesclados[2].sm_rootzone_pctl is None
+
+
+def test_decendios_com_umidade_smap() -> None:
+    dias = _serie(
+        10, sm_surface=lambda d, s: 0.2, sm_rootzone=lambda d, s: 0.25 + s / 100,
+        sm_rootzone_wetness=lambda d, s: 0.5, sm_rootzone_pctl=lambda d, s: 10.0 * s,
+    )
+    r = agregar_decendios(dias)[0]
+    assert r.sm_surface_media == 0.2
+    assert r.sm_rootzone_media == pytest.approx(0.295)  # média de 0,25..0,34
+    assert r.sm_rootzone_wetness_media == 0.5
+    assert r.sm_rootzone_pctl_media == 45.0
+
+
+def test_decendios_sem_smap_ficam_none() -> None:
+    r = agregar_decendios(_serie(10))[0]
+    assert r.sm_rootzone_media is None and r.sm_rootzone_pctl_media is None
+    # Só 4 safras com SMAP (< MIN_SAFRAS_VALIDAS) → "Sem dado".
+    r = agregar_decendios(_serie(10, sm_rootzone=lambda d, s: 0.3 if s < 4 else None))[0]
+    assert r.sm_rootzone_media is None

@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parent.parent
@@ -22,6 +23,19 @@ class Settings(BaseSettings):
     power_seed_dir: Path = APP_DIR / "data" / "power"
     # Cache local de respostas do POWER (fora do git).
     power_cache_dir: Path = PROJECT_DIR / ".cache" / "power"
+
+    # Google Earth Engine (umidade do solo SMAP L4). Sem projeto nem chave, só lê semente/cache.
+    ee_project: str | None = None
+    # JSON da conta de serviço registrada no Earth Engine; sem ele, usa `earthengine authenticate`.
+    ee_service_account_key: Path | None = None
+    smap_asset: str = "NASA/SMAP/SPL4SMGP/008"
+    smap_seed_dir: Path = APP_DIR / "data" / "smap"
+    smap_cache_dir: Path = PROJECT_DIR / ".cache" / "smap"
+
+    @field_validator("ee_project", "ee_service_account_key", mode="before")
+    @classmethod
+    def _vazio_e_none(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
 
 
 @lru_cache

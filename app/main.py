@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.services.power_client import PowerClient
+from app.services.smap_client import SmapClient, buscar_ee
 
 settings = get_settings()
 
@@ -20,6 +21,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             base_url=settings.power_base_url,
             seed_dir=settings.power_seed_dir,
             cache_dir=settings.power_cache_dir,
+        )
+        ee_configurado = bool(settings.ee_project or settings.ee_service_account_key)
+        app.state.smap_client = SmapClient(
+            seed_dir=settings.smap_seed_dir,
+            cache_dir=settings.smap_cache_dir,
+            buscar=buscar_ee(
+                settings.smap_asset, settings.ee_project, settings.ee_service_account_key
+            )
+            if ee_configurado
+            else None,
         )
         yield
 
