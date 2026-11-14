@@ -1,7 +1,8 @@
 from fastapi import APIRouter
 
-from app.api.routes import crops, health
+from app.api.routes import clima, crops, health
 
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(crops.router)
+api_router.include_router(clima.router)

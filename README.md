@@ -34,6 +34,28 @@ Dados de requisitos agroclimáticos de 2.568 culturas, lidos de `app/data/EcoCro
 Os valores de texto ficam em inglês, como na FAO. Para atualizar o CSV:
 `uv run python scripts/download_ecocrop.py`.
 
+## Clima (NASA POWER, por decêndio)
+
+Série diária do [NASA POWER](https://power.larc.nasa.gov/) (comunidade AG) das **10 últimas safras
+completas** (setembro a agosto, encerradas há pelo menos 30 dias). A ET0 é calculada aqui por
+Penman-Monteith FAO-56, com a pressão de vapor pelo ponto de orvalho, a umidade relativa como
+reserva e Hargreaves quando faltam radiação ou vento.
+
+- `GET /api/clima/decendios?lat=-12.55&lon=-55.72`: 36 decêndios (0 = 1–10/set, 35 = 21–31/ago).
+  Traz chuva média e P20 (superada em 8 de cada 10 anos), ET0, Tmin/Tmax (média, média dos
+  extremos de cada safra e extremo absoluto) e umidade do solo (`GWETTOP`/`GWETROOT`, 0–1).
+  `null` = "Sem dado" (menos de 5 safras válidas).
+- `GET /api/clima/diario?lat&lon[&inicio=AAAA-MM-DD&fim=AAAA-MM-DD]`: série diária bruta com
+  a ET0, recortada da mesma janela (fora dela, 422).
+
+**Resolução:** o ponto é encaixado na célula MERRA-2 (0,5° × 0,625°, ~50 km). O resultado vale
+para a região, não para o talhão, e talhões vizinhos devolvem os mesmos números.
+
+**Cache (obrigatório: a NASA bloqueia consultas repetidas):** uma consulta por célula, lida
+primeiro de `app/data/power/` (semente versionada, demo sem rede), depois de `.cache/power/`
+(local, fora do git) e só então da rede. Para pré-baixar um ponto:
+`uv run python -m scripts.baixar_power [lat lon]` (padrão: Sorriso-MT).
+
 ## Testes e lint
 
 ```bash

@@ -11,3 +11,6 @@ wheels/
 
 # Environment
 .env
+
+# Cache local do NASA POWER
+.cache/
