@@ -10,6 +10,8 @@ Access notes:
   is cached on disk. Read order: versioned seed (`seed_dir`), local cache (`cache_dir`), network.
 - Built-up areas (e.g. a city center) have no soil prediction and come back as nulls. The client
   then searches the nearest point with data on rings around the requested location.
+- The API is often slow or down. After an outage a circuit breaker skips the network for a while,
+  and `nearest_cached` gives the closest point already on disk (any region) as a fallback.
 """
 
 import asyncio
@@ -17,11 +19,12 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import httpx
 
+from app.services.fallback import DEFAULT_COOLDOWN_S, CircuitBreaker, distance_km
 from app.services.soil import SoilProfile, SoilTexture
 
 log = logging.getLogger(__name__)
@@ -173,15 +176,15 @@ def search_points(lat: float, lon: float) -> list[tuple[float, float, float]]:
     """Requested point first, then rings of SEARCH_RINGS_KM; (lat, lon, distance_km)."""
     points = [(round(lat, 4), round(lon, 4), 0.0)]
     km_per_degree_lon = KM_PER_DEGREE_LAT * max(0.01, math.cos(math.radians(lat)))
-    for distance_km in SEARCH_RINGS_KM:
+    for ring_km in SEARCH_RINGS_KM:
         for bearing in SEARCH_BEARINGS_DEG:
-            north = distance_km * math.cos(math.radians(bearing))
-            east = distance_km * math.sin(math.radians(bearing))
+            north = ring_km * math.cos(math.radians(bearing))
+            east = ring_km * math.sin(math.radians(bearing))
             points.append(
                 (
                     round(lat + north / KM_PER_DEGREE_LAT, 4),
                     round(lon + east / km_per_degree_lon, 4),
-                    distance_km,
+                    ring_km,
                 )
             )
     return points
@@ -189,6 +192,34 @@ def search_points(lat: float, lon: float) -> list[tuple[float, float, float]]:
 
 def cache_key(lat: float, lon: float) -> str:
     return f"soilgrids_{CACHE_VERSION}_{lat:.4f}_{lon:.4f}.json"
+
+
+def cache_key_location(name: str) -> tuple[float, float] | None:
+    """(lat, lon) of a cache file name written by `cache_key`, or None for other files."""
+    prefix = f"soilgrids_{CACHE_VERSION}_"
+    if not (name.startswith(prefix) and name.endswith(".json")):
+        return None
+    try:
+        lat, lon = name.removeprefix(prefix).removesuffix(".json").split("_")
+        return float(lat), float(lon)
+    except ValueError:
+        return None
+
+
+def estimate_from_point(
+    point: SoilGridsPoint, lat: float, lon: float, distance: float
+) -> SoilEstimate:
+    """Soil estimate for the requested (lat, lon) read at `point`, `distance` km away."""
+    return SoilEstimate(
+        requested_lat=lat,
+        requested_lon=lon,
+        sampled_lat=point.lat,
+        sampled_lon=point.lon,
+        distance_km=distance,
+        root_zone_texture=depth_weighted_texture(point, ROOT_ZONE_BOTTOM_CM),
+        zarc_layer_texture=depth_weighted_texture(point, ZARC_LAYER_BOTTOM_CM),
+        topsoil_texture=depth_weighted_texture(point, TOPSOIL_BOTTOM_CM),
+    )
 
 
 class SoilGridsClient:
@@ -201,6 +232,7 @@ class SoilGridsClient:
         cache_dir: Path,
         min_interval_s: float = 12.0,
         backoff_s: tuple[float, ...] = (5.0, 15.0),
+        cooldown_s: float = DEFAULT_COOLDOWN_S,
     ) -> None:
         self._http = http
         self._base_url = base_url.rstrip("/")
@@ -212,6 +244,34 @@ class SoilGridsClient:
         self._last_call = -math.inf
         self._estimates: dict[tuple[float, float], SoilEstimate] = {}
         self._locks: dict[tuple[float, float], asyncio.Lock] = {}
+        self._breaker = CircuitBreaker(cooldown_s)
+
+    def mark_unavailable(self) -> None:
+        """Skip the network for the cooldown (e.g. after a caller gave up waiting)."""
+        self._breaker.trip()
+
+    def nearest_cached(self, lat: float, lon: float) -> SoilEstimate | None:
+        """Closest point with data among the seed and disk cache (any distance), no network.
+
+        Fallback when SoilGrids is down: `distance_km` is the real distance to that point.
+        """
+        candidates: dict[tuple[float, float], Path] = {}
+        for folder in (self._cache_dir, self._seed_dir):  # seed wins on duplicates
+            if folder.is_dir():
+                for path in folder.glob(f"soilgrids_{CACHE_VERSION}_*.json"):
+                    if (location := cache_key_location(path.name)) is not None:
+                        candidates[location] = path
+        by_distance = sorted(candidates.items(), key=lambda item: distance_km(lat, lon, *item[0]))
+        for (point_lat, point_lon), path in by_distance:
+            try:
+                point = parse(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, SoilGridsInvalidResponse):
+                log.warning("unreadable SoilGrids cache, ignoring: %s", path)
+                continue
+            if point.has_data:
+                distance = round(distance_km(lat, lon, point_lat, point_lon), 1)
+                return estimate_from_point(point, lat, lon, distance)
+        return None
 
     async def estimate(self, lat: float, lon: float) -> SoilEstimate:
         """Soil at the location, or at the nearest point with data on the search rings."""
@@ -235,19 +295,12 @@ class SoilGridsClient:
         return key, raw
 
     async def _search(self, lat: float, lon: float) -> SoilEstimate:
-        for point_lat, point_lon, distance_km in search_points(lat, lon):
+        for point_lat, point_lon, ring_km in search_points(lat, lon):
             _, raw = await self.raw(point_lat, point_lon)
             point = parse(raw)
             if point.has_data:
-                return SoilEstimate(
-                    requested_lat=lat,
-                    requested_lon=lon,
-                    sampled_lat=point_lat,
-                    sampled_lon=point_lon,
-                    distance_km=distance_km,
-                    root_zone_texture=depth_weighted_texture(point, ROOT_ZONE_BOTTOM_CM),
-                    zarc_layer_texture=depth_weighted_texture(point, ZARC_LAYER_BOTTOM_CM),
-                    topsoil_texture=depth_weighted_texture(point, TOPSOIL_BOTTOM_CM),
+                return estimate_from_point(
+                    replace(point, lat=point_lat, lon=point_lon), lat, lon, ring_km
                 )
         rings = ", ".join(f"{distance:g}" for distance in SEARCH_RINGS_KM)
         raise SoilGridsNoData(f"no SoilGrids data at {lat}, {lon} nor within {rings} km")
@@ -275,6 +328,8 @@ class SoilGridsClient:
         params += [("depth", depth) for depth in DEPTHS]
         params.append(("value", "mean"))
         url = f"{self._base_url}/soilgrids/v2.0/properties/query"
+        if self._breaker.is_open:
+            raise SoilGridsUnavailable("SoilGrids unavailable recently; retry later")
         error = ""
         for attempt in range(ATTEMPTS):
             async with self._network_lock:  # fair use: one call at a time, spaced
@@ -304,4 +359,5 @@ class SoilGridsClient:
                 pause = self._backoff_s[min(attempt, len(self._backoff_s) - 1)]
                 log.warning("SoilGrids failed (%s), retrying in %.0f s", error, pause)
                 await asyncio.sleep(pause)
+        self._breaker.trip()
         raise SoilGridsUnavailable(f"SoilGrids unavailable after {ATTEMPTS} attempts ({error})")

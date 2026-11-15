@@ -45,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             base_url=settings.power_base_url,
             seed_dir=settings.power_seed_dir,
             cache_dir=settings.power_cache_dir,
+            cooldown_s=settings.external_cooldown_s,
         )
         app.state.soilgrids_client = SoilGridsClient(
             soilgrids_http,
@@ -52,6 +53,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             seed_dir=settings.soilgrids_seed_dir,
             cache_dir=settings.soilgrids_cache_dir,
             min_interval_s=settings.soilgrids_min_interval_s,
+            cooldown_s=settings.external_cooldown_s,
         )
         app.state.ee_status = await _checar_earth_engine()
         app.state.smap_client = SmapClient(

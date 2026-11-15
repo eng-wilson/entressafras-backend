@@ -4,6 +4,7 @@ API tests run the real ranking on the Sorriso POWER seed (app/data/power), with 
 """
 
 import asyncio
+import time
 from collections.abc import Iterator
 from dataclasses import replace
 from datetime import date, timedelta
@@ -53,6 +54,7 @@ from app.services.soil import (
 )
 from app.services.soilgrids_client import (
     SoilGridsClient,
+    SoilGridsInvalidResponse,
     SoilGridsNoData,
     SoilGridsUnavailable,
 )
@@ -490,32 +492,140 @@ def test_estimated_soil_is_close_to_the_brazilian_local_equation(tmp_path) -> No
     assert global_mm_per_m == pytest.approx(local_mm_per_m, rel=0.2)
 
 
-class _FailingSoilGrids:
-    def __init__(self, error: Exception) -> None:
+# --- External sources down: always answer from cached data ---------------------------------
+
+# In the seeded Sorriso POWER cell, but about 37 km from the seeded SoilGrids points.
+UNSEEDED = {"lat": -12.3, "lon": -55.5}
+
+
+class _FailingSoilGrids(SoilGridsClient):
+    """Seed-backed client whose live estimate fails (or hangs with error=None)."""
+
+    def __init__(self, cache_dir, error: Exception | None, seed_dir=None) -> None:
+        super().__init__(
+            httpx.AsyncClient(transport=httpx.MockTransport(_no_network)),
+            base_url="https://soilgrids.test",
+            seed_dir=seed_dir or get_settings().soilgrids_seed_dir,
+            cache_dir=cache_dir,
+            min_interval_s=0.0,
+        )
         self.error = error
+        self.estimate_calls = 0
 
     async def estimate(self, lat: float, lon: float):
+        self.estimate_calls += 1
+        if self.error is None:
+            await asyncio.sleep(3600)
         raise self.error
 
 
+class _HangingPower(pc.PowerClient):
+    async def serie(self, lat, lon, janela=None):
+        await asyncio.sleep(3600)
+
+
+@pytest.fixture
+def swap_clients(client: TestClient, monkeypatch) -> Iterator:
+    """Replace the SoilGrids and/or POWER client for one test; tiny wait budget."""
+    monkeypatch.setattr(get_settings(), "external_wait_budget_s", 0.2)
+    previous = dict(app.dependency_overrides)
+
+    def swap(soilgrids=None, power=None) -> None:
+        if soilgrids is not None:
+            app.dependency_overrides[get_soilgrids_client] = lambda: soilgrids
+        if power is not None:
+            app.dependency_overrides[get_power_client] = lambda: power
+
+    yield swap
+    app.dependency_overrides.update(previous)
+
+
+def _fallback_warnings(body: dict, source: str) -> list[str]:
+    return [w for w in body["warnings"] if w.startswith(f"{source} did not answer")]
+
+
 @pytest.mark.parametrize(
-    ("error", "status"),
-    [(SoilGridsNoData("no data"), 422), (SoilGridsUnavailable("down"), 503)],
+    "error",
+    [
+        None,  # hangs past the budget
+        SoilGridsUnavailable("down"),
+        SoilGridsNoData("no data"),
+        SoilGridsInvalidResponse("bad"),
+    ],
 )
-def test_soilgrids_failure_asks_for_soil_type(client: TestClient, error, status: int) -> None:
-    previous = app.dependency_overrides[get_soilgrids_client]
-    app.dependency_overrides[get_soilgrids_client] = lambda: _FailingSoilGrids(error)
-    try:
-        resp = client.post(URL, json={"location": SORRISO})
-        assert resp.status_code == status
-        assert "soil_type" in resp.json()["detail"]
-        # With soil_type the estimate only feeds the soil properties panel.
-        resp = client.post(URL, json=BODY)
-        assert resp.status_code == 200
-        assert resp.json()["soil_properties"] is None
-        assert any("panel unavailable" in w for w in resp.json()["warnings"])
-    finally:
-        app.dependency_overrides[get_soilgrids_client] = previous
+def test_soilgrids_down_falls_back_to_the_nearest_cached_soil(
+    client: TestClient, swap_clients, tmp_path, error
+) -> None:
+    soilgrids = _FailingSoilGrids(tmp_path, error)
+    swap_clients(soilgrids=soilgrids)
+    started = time.perf_counter()
+    resp = client.post(URL, json={"location": UNSEEDED, "agricultural_year": 2027})
+    assert resp.status_code == 200, resp.text
+    assert time.perf_counter() - started < 10
+    body = resp.json()
+    soil = body["soil"]
+    assert soil["source"] == "SOILGRIDS_SAXTON_RAWLS_2006"
+    # The only cached soil is around Sorriso.
+    assert soil["sampled_location"]["lat"] == pytest.approx(SORRISO["lat"], abs=0.05)
+    assert 20 < soil["distance_km"] < 60
+    assert body["soil_properties"] is not None
+    [warning] = _fallback_warnings(body, "SoilGrids")
+    assert f"{soil['distance_km']:g} km" in warning
+    if error is None:
+        assert soilgrids._breaker.is_open  # the next requests skip the network
+
+    # With soil_type the simulation follows it; the panel still comes from the cache.
+    resp = client.post(URL, json={**BODY, "location": UNSEEDED, "agricultural_year": 2027})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["soil"]["source"] == "REQUEST_TEXTURE_CLASS"
+    assert body["soil_properties"]["distance_km"] > 20
+    assert len(_fallback_warnings(body, "SoilGrids")) == 1
+
+
+def test_without_any_cached_soil_a_medium_texture_is_assumed(
+    client: TestClient, swap_clients, tmp_path
+) -> None:
+    empty = tmp_path / "empty"
+    swap_clients(soilgrids=_FailingSoilGrids(tmp_path, SoilGridsUnavailable("down"), empty))
+    resp = client.post(URL, json={"location": UNSEEDED, "agricultural_year": 2027})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["soil"]["source"] == "REQUEST_TEXTURE_CLASS"
+    assert body["soil_type"] == "medium"
+    assert body["soil_properties"] is None
+    assert any("assumed medium texture" in w for w in body["warnings"])
+
+
+def test_simulate_with_soil_type_never_waits_for_soilgrids(
+    client: TestClient, swap_clients, tmp_path
+) -> None:
+    soilgrids = _FailingSoilGrids(tmp_path, None)
+    swap_clients(soilgrids=soilgrids)
+    body = _simulate(client, {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]}, sweep=False)
+    assert soilgrids.estimate_calls == 0
+    assert not _fallback_warnings(body, "SoilGrids")
+
+
+def test_power_down_falls_back_to_the_nearest_cached_climate(
+    client: TestClient, swap_clients, tmp_path
+) -> None:
+    power = _HangingPower(
+        httpx.AsyncClient(transport=httpx.MockTransport(_no_network)),
+        base_url="https://power.test",
+        seed_dir=get_settings().power_seed_dir,
+        cache_dir=tmp_path,
+    )
+    swap_clients(power=power, soilgrids=_FailingSoilGrids(tmp_path, SoilGridsUnavailable("down")))
+    location = {"lat": -12.0, "lon": -55.0}  # cell -12.0/-55.0 is not seeded; Sorriso is nearest
+    for url, extra in ((URL, {}), (SIMULATE_URL, {"rotation": {"crops": [{"code": SOYBEAN}]}})):
+        resp = client.post(
+            url, json={**BODY, "location": location, "agricultural_year": 2027, **extra}
+        )
+        assert resp.status_code == 200, resp.text
+        [warning] = _fallback_warnings(resp.json(), "NASA POWER")
+        assert "-12.5, -55.625" in warning
+    assert power._breaker.is_open
 
 
 # --- Catalog --------------------------------------------------------------------------------

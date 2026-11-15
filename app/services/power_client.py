@@ -4,6 +4,9 @@ O cache é obrigatório: a NASA bloqueia aplicações que repetem a mesma consul
 encaixado na célula MERRA-2 (0,5° × 0,625°), então talhões vizinhos dividem a mesma consulta e o
 mesmo arquivo. Ordem de leitura: semente versionada (`power_seed_dir`), cache local
 (`power_cache_dir`) e só então a rede.
+
+When POWER is down, a circuit breaker skips the network for a while and `nearest_cached` gives
+the closest cell already on disk (any region) as a fallback.
 """
 
 import asyncio
@@ -16,6 +19,7 @@ from pathlib import Path
 import httpx
 
 from app.services.agro import DiaClima, et0_dia, rotulo_safra
+from app.services.fallback import DEFAULT_COOLDOWN_S, CircuitBreaker, distance_km
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +96,34 @@ def chave_cache(lat_c: float, lon_c: float, inicio: date, fim: date) -> str:
     return f"power_{CACHE_VERSAO}_{lat_c:.3f}_{lon_c:.3f}_{inicio:%Y%m%d}_{fim:%Y%m%d}.json"
 
 
+@dataclass(frozen=True)
+class CachedSeries:
+    """Cell and window of a cache file name written by `chave_cache`."""
+
+    lat: float
+    lon: float
+    start: date
+    end: date
+    path: Path
+
+
+def parse_cache_name(path: Path) -> CachedSeries | None:
+    prefix = f"power_{CACHE_VERSAO}_"
+    if not (path.name.startswith(prefix) and path.name.endswith(".json")):
+        return None
+    try:
+        lat, lon, start, end = path.name.removeprefix(prefix).removesuffix(".json").split("_")
+        return CachedSeries(
+            float(lat),
+            float(lon),
+            datetime.strptime(start, "%Y%m%d").date(),
+            datetime.strptime(end, "%Y%m%d").date(),
+            path,
+        )
+    except ValueError:
+        return None
+
+
 def _valor(v: float | None) -> float | None:
     return None if v is None or v <= FILL_VALUE + 0.5 else float(v)
 
@@ -143,6 +175,7 @@ class PowerClient:
         seed_dir: Path,
         cache_dir: Path,
         backoff_s: tuple[float, ...] = BACKOFF_S,
+        cooldown_s: float = DEFAULT_COOLDOWN_S,
     ) -> None:
         self._http = http
         self._base_url = base_url.rstrip("/")
@@ -151,6 +184,43 @@ class PowerClient:
         self._backoff_s = backoff_s
         self._locks: dict[str, asyncio.Lock] = {}
         self._memoria: dict[str, SerieDiaria] = {}
+        self._breaker = CircuitBreaker(cooldown_s)
+
+    def mark_unavailable(self) -> None:
+        """Skip the network for the cooldown (e.g. after a caller gave up waiting)."""
+        self._breaker.trip()
+
+    def nearest_cached(self, lat: float, lon: float, janela: Janela) -> SerieDiaria | None:
+        """Closest cached cell (seed or disk cache, any distance), no network.
+
+        Fallback when POWER is down. Files with the requested window come first; otherwise the
+        closest cell, latest window first. Unreadable files are skipped.
+        """
+        files: dict[str, CachedSeries] = {}
+        for pasta in (self._cache_dir, self._seed_dir):  # seed wins on duplicates
+            if pasta.is_dir():
+                for arquivo in pasta.glob(f"power_{CACHE_VERSAO}_*.json"):
+                    if (cached := parse_cache_name(arquivo)) is not None:
+                        files[arquivo.name] = cached
+
+        def order(cached: CachedSeries) -> tuple:
+            same_window = (cached.start, cached.end) == (janela.inicio, janela.fim)
+            distance = distance_km(lat, lon, cached.lat, cached.lon)
+            return (not same_window, round(distance, 3), -cached.end.toordinal())
+
+        for cached in sorted(files.values(), key=order):
+            chave = cached.path.name
+            if chave in self._memoria:
+                return self._memoria[chave]
+            try:
+                bruto = json.loads(cached.path.read_text(encoding="utf-8"))
+                serie = interpretar(bruto, cached.lat, cached.lon)
+            except (OSError, ValueError, RespostaInvalida):
+                log.warning("unreadable POWER cache, ignoring: %s", cached.path)
+                continue
+            self._memoria[chave] = serie
+            return serie
+        return None
 
     async def serie(self, lat: float, lon: float, janela: Janela | None = None) -> SerieDiaria:
         """Série diária da célula do ponto na janela de safras (padrão: 10 últimas)."""
@@ -208,6 +278,8 @@ class PowerClient:
             "format": "JSON",
         }
         url = f"{self._base_url}/api/temporal/daily/point"
+        if self._breaker.is_open:
+            raise PowerIndisponivel("NASA POWER unavailable recently; retry later")
         erro: str = ""
         for tentativa in range(TENTATIVAS):
             try:
@@ -224,4 +296,5 @@ class PowerClient:
                 espera = self._backoff_s[min(tentativa, len(self._backoff_s) - 1)]
                 log.warning("POWER falhou (%s), nova tentativa em %.0f s", erro, espera)
                 await asyncio.sleep(espera)
+        self._breaker.trip()
         raise PowerIndisponivel(f"NASA POWER indisponível após {TENTATIVAS} tentativas ({erro})")

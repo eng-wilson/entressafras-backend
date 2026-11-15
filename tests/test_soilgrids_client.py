@@ -1,6 +1,7 @@
 """SoilGrids client against synthetic answers (no network)."""
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -191,3 +192,54 @@ def test_network_calls_are_spaced(tmp_path: Path) -> None:
     asyncio.run(client.estimate(-12.55, -55.72))
     assert len(calls) == 2
     assert time.monotonic() - started >= 0.2
+
+
+def _write_cached(folder: Path, lat: float, lon: float, values=None) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / cache_key(lat, lon)).write_text(json.dumps(answer(lat, lon, values)))
+
+
+def test_nearest_cached_takes_the_closest_point_with_data(tmp_path: Path) -> None:
+    client, calls = make_client(tmp_path, lambda request: httpx.Response(503))
+    _write_cached(tmp_path / "seed", -12.55, -55.72)
+    _write_cached(tmp_path / "cache", -15.0, -50.1, NULLS)  # closest, but without data
+    _write_cached(tmp_path / "cache", -16.0, -50.0)
+    estimate = client.nearest_cached(-15.0, -50.0)
+    assert estimate is not None
+    assert (estimate.sampled_lat, estimate.sampled_lon) == (-16.0, -50.0)
+    assert (estimate.requested_lat, estimate.requested_lon) == (-15.0, -50.0)
+    assert estimate.distance_km == pytest.approx(111.2, abs=0.5)
+    assert estimate.topsoil_texture == depth_weighted_texture(parse(answer(0, 0)), 30)
+    assert calls == []
+
+
+def test_nearest_cached_without_any_cached_point_is_none(tmp_path: Path) -> None:
+    client, _ = make_client(tmp_path, lambda request: httpx.Response(503))
+    assert client.nearest_cached(-15.0, -50.0) is None
+
+
+def test_after_an_outage_calls_fail_fast_until_the_cooldown(tmp_path: Path) -> None:
+    client, calls = make_client(tmp_path, lambda request: httpx.Response(503))
+    client._breaker.cooldown_s = 0.2
+    with pytest.raises(SoilGridsUnavailable):
+        asyncio.run(client.estimate(-12.62, -55.8))
+    assert len(calls) == 3
+    with pytest.raises(SoilGridsUnavailable, match="recently"):
+        asyncio.run(client.estimate(-13.0, -56.0))
+    assert len(calls) == 3  # no network while the breaker is open
+    import time
+
+    time.sleep(0.25)
+    with pytest.raises(SoilGridsUnavailable):
+        asyncio.run(client.estimate(-13.0, -56.0))
+    assert len(calls) == 6
+
+
+def test_mark_unavailable_opens_the_breaker_but_cache_still_answers(tmp_path: Path) -> None:
+    client, calls = make_client(tmp_path, lambda request: httpx.Response(503))
+    _write_cached(tmp_path / "seed", -12.62, -55.8)
+    client.mark_unavailable()
+    assert asyncio.run(client.estimate(-12.62, -55.8)).distance_km == 0.0
+    with pytest.raises(SoilGridsUnavailable):
+        asyncio.run(client.estimate(-13.0, -56.0))
+    assert calls == []

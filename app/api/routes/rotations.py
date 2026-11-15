@@ -1,12 +1,13 @@
 import asyncio
+import logging
 from datetime import date
-from typing import Annotated
+from typing import Annotated, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 
 from app.api.routes.clima import Client
-from app.api.routes.clima import _serie as fetch_power_series
+from app.core.config import get_settings
 from app.schemas.rotation import (
     RotationContext,
     RotationRecommendationsResponse,
@@ -17,7 +18,15 @@ from app.schemas.rotation import (
     SoilProperties,
 )
 from app.services.ecocrop import CropRepository, get_repository
-from app.services.power_client import PowerClient, SerieDiaria, janela_safras
+from app.services.fallback import distance_km
+from app.services.power_client import (
+    Janela,
+    PowerClient,
+    PowerIndisponivel,
+    RespostaInvalida,
+    SerieDiaria,
+    janela_safras,
+)
 from app.services.rotations import (
     ROTATION_SEASONS,
     CustomRotationError,
@@ -28,16 +37,30 @@ from app.services.rotations import (
     soil_info_from_texture_class,
     soil_properties_from_estimate,
 )
+from app.services.soil import SoilType
 from app.services.soilgrids_client import (
+    SoilEstimate,
     SoilGridsClient,
     SoilGridsInvalidResponse,
     SoilGridsNoData,
     SoilGridsUnavailable,
 )
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/rotations", tags=["rotations"])
 
-SEND_SOIL_TYPE = "send soil_type (sandy, medium or clayey) to skip the soil estimate"
+POWER_FALLBACK_WARNING = (
+    "NASA POWER did not answer ({reason}); climate from the nearest cached cell at {lat:g}, "
+    "{lon:g} ({distance:.0f} km away, seasons {start}–{end}). Risks describe that cell."
+)
+SOILGRIDS_FALLBACK_WARNING = (
+    "SoilGrids did not answer for this location ({reason}); soil from the nearest cached point "
+    "({distance:g} km away). Send soil_type if it does not describe the field."
+)
+NO_SOIL_WARNING = (
+    "Soil estimate unavailable ({reason}) and no cached soil to fall back on; assumed medium "
+    "texture. Send soil_type for a better estimate."
+)
 
 
 def get_today() -> date:
@@ -56,29 +79,99 @@ SoilGrids = Annotated[SoilGridsClient, Depends(get_soilgrids_client)]
 SoilErrors = (SoilGridsNoData, SoilGridsUnavailable, SoilGridsInvalidResponse)
 
 
-async def _soil(
-    soilgrids: SoilGridsClient, request: RotationContext
-) -> tuple[SoilInfo, SoilProperties | None, str | None]:
-    """Soil for the simulation, plus the soil properties panel (or why it is missing).
+def _wait_budget_s() -> float:
+    return get_settings().external_wait_budget_s
 
-    With soil_type the SoilGrids estimate only feeds the panel, so its failure is not an error.
-    """
-    if request.soil_type is not None:
-        soil = soil_info_from_texture_class(request.soil_type)
-        try:
-            estimate = await soilgrids.estimate(request.location.lat, request.location.lon)
-        except SoilErrors as exc:
-            return soil, None, str(exc)
-        return soil, soil_properties_from_estimate(estimate), None
+
+class SoilInputs(NamedTuple):
+    soil: SoilInfo
+    properties: SoilProperties | None  # the soil properties panel
+    properties_error: str | None  # why the panel is missing
+    warning: str | None  # set when the soil comes from a fallback
+
+
+class Inputs(NamedTuple):
+    series: SerieDiaria
+    season_years: list[int]
+    soil: SoilInputs
+    warnings: list[str]  # fallbacks used to answer without an external source
+
+
+async def _soil_estimate(
+    soilgrids: SoilGridsClient, lat: float, lon: float
+) -> tuple[SoilEstimate | None, str | None, str | None]:
+    """(estimate, fallback warning, failure reason): live within the budget, else the cache."""
+    budget = _wait_budget_s()
     try:
-        estimate = await soilgrids.estimate(request.location.lat, request.location.lon)
-    except SoilGridsNoData as exc:
-        raise HTTPException(status_code=422, detail=f"{exc}; {SEND_SOIL_TYPE}") from exc
-    except SoilGridsUnavailable as exc:
-        raise HTTPException(status_code=503, detail=f"{exc}; {SEND_SOIL_TYPE}") from exc
-    except SoilGridsInvalidResponse as exc:
-        raise HTTPException(status_code=502, detail=f"{exc}; {SEND_SOIL_TYPE}") from exc
-    return soil_info_from_estimate(estimate), soil_properties_from_estimate(estimate), None
+        return await asyncio.wait_for(soilgrids.estimate(lat, lon), budget), None, None
+    except TimeoutError:
+        soilgrids.mark_unavailable()
+        reason = f"no answer within {budget:g} s"
+    except SoilErrors as exc:
+        reason = str(exc)
+    log.warning("SoilGrids failed for %s, %s (%s); using the cached fallback", lat, lon, reason)
+    fallback = soilgrids.nearest_cached(lat, lon)
+    if fallback is None:
+        return None, None, reason
+    warning = SOILGRIDS_FALLBACK_WARNING.format(reason=reason, distance=fallback.distance_km)
+    return fallback, warning, None
+
+
+async def _soil(
+    soilgrids: SoilGridsClient, request: RotationContext, need_properties: bool = True
+) -> SoilInputs:
+    """Soil for the simulation, the soil properties panel and the fallback warning, if any.
+
+    Never fails: when SoilGrids is slow or down, the nearest cached point (any distance) is
+    used, and without any cached point the request soil_type, or a medium texture. With
+    soil_type the estimate only feeds the panel, so it is skipped when not needed.
+    """
+    lat, lon = request.location.lat, request.location.lon
+    if request.soil_type is not None and not need_properties:
+        return SoilInputs(soil_info_from_texture_class(request.soil_type), None, None, None)
+    estimate, warning, reason = await _soil_estimate(soilgrids, lat, lon)
+    if estimate is None:
+        soil = soil_info_from_texture_class(request.soil_type or SoilType.MEDIUM)
+        if request.soil_type is None:
+            warning = NO_SOIL_WARNING.format(reason=reason)
+        return SoilInputs(soil, None, reason, warning)
+    soil = (
+        soil_info_from_texture_class(request.soil_type)
+        if request.soil_type is not None
+        else soil_info_from_estimate(estimate)
+    )
+    return SoilInputs(soil, soil_properties_from_estimate(estimate), None, warning)
+
+
+async def _climate(
+    client: PowerClient, lat: float, lon: float, window: Janela
+) -> tuple[SerieDiaria, list[int], str | None]:
+    """POWER series, its season years and the fallback warning (nearest cached cell), if any."""
+    budget = _wait_budget_s()
+    try:
+        series = await asyncio.wait_for(client.serie(lat, lon, window), budget)
+        return series, list(range(window.inicio.year, window.fim.year)), None
+    except TimeoutError:
+        client.mark_unavailable()
+        reason = f"no answer within {budget:g} s"
+    except (PowerIndisponivel, RespostaInvalida) as exc:
+        reason = str(exc)
+    log.warning("POWER failed for %s, %s (%s); using the nearest cached cell", lat, lon, reason)
+    series = client.nearest_cached(lat, lon, window)
+    if series is None:  # the repository ships seeded cells, so this needs a broken deploy
+        raise HTTPException(
+            status_code=503, detail=f"NASA POWER unavailable ({reason}) and no cached climate"
+        )
+    start, end = series.inicio.year, series.fim.year
+    warning = POWER_FALLBACK_WARNING.format(
+        reason=reason,
+        lat=series.lat,
+        lon=series.lon,
+        distance=distance_km(lat, lon, series.lat, series.lon),
+        start=start,
+        end=end,
+    )
+    return series, list(range(start, end)), warning
 
 
 @router.post("/recommendations", response_model=RotationRecommendationsResponse)
@@ -100,25 +193,26 @@ async def recommend_rotations(
     Optional `custom_rotations` are simulated and placed in the same ranking (returned apart,
     the recommended `rotations` do not change).
     """
-    series, season_years, (soil, soil_properties, soil_properties_error) = await _inputs(
-        request, repository, client, soilgrids, today
-    )
-    # CPU-bound (about 6 s on 30 seasons, then cached per cell and soil): keep it off the loop.
+    inputs = await _inputs(request, repository, client, soilgrids, today)
+    series, soil = inputs.series, inputs.soil
+    # CPU-bound (about 1.5 s on 30 seasons, then cached per cell and soil): keep it off the loop.
     try:
-        return await run_in_threadpool(
+        response = await run_in_threadpool(
             recommendations,
             repository,
             request,
             series.dias,
-            season_years,
+            inputs.season_years,
             today,
             (series.lat, series.lon),
-            soil,
-            soil_properties,
-            soil_properties_error,
+            soil.soil,
+            soil.properties,
+            soil.properties_error,
         )
     except CustomRotationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    response.warnings.extend(inputs.warnings)
+    return response
 
 
 @router.post("/simulate", response_model=RotationSimulationResponse)
@@ -137,22 +231,25 @@ async def simulate(
     also returns the same rotation with the planting date on every decêndio of the season, so a
     client can show the best and worst dates while the farmer drags them without new requests.
     """
-    series, season_years, (soil, _, _) = await _inputs(
-        request, repository, client, soilgrids, today
+    inputs = await _inputs(
+        request, repository, client, soilgrids, today, need_soil_properties=False
     )
+    series = inputs.series
     try:
-        return await run_in_threadpool(
+        response = await run_in_threadpool(
             simulate_rotation,
             repository,
             request,
             series.dias,
-            season_years,
+            inputs.season_years,
             today,
             (series.lat, series.lon),
-            soil,
+            inputs.soil.soil,
         )
     except CustomRotationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    response.warnings.extend(inputs.warnings)
+    return response
 
 
 async def _inputs(
@@ -161,15 +258,21 @@ async def _inputs(
     client: PowerClient,
     soilgrids: SoilGridsClient,
     today: date,
-) -> tuple[SerieDiaria, list[int], tuple[SoilInfo, SoilProperties | None, str | None]]:
-    """Climate series, historical season years and soil of a rotation request."""
+    need_soil_properties: bool = True,
+) -> Inputs:
+    """Climate series, historical season years and soil of a rotation request.
+
+    POWER and SoilGrids are queried in parallel, each within `external_wait_budget_s`; past it
+    (or on error) the nearest cached data is used and named in `warnings`.
+    """
     try:
         history_families(repository, request.crop_history)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     window = janela_safras(today, ROTATION_SEASONS)
-    series, soil = await asyncio.gather(
-        fetch_power_series(client, request.location.lat, request.location.lon, window),
-        _soil(soilgrids, request),
+    (series, season_years, climate_warning), soil = await asyncio.gather(
+        _climate(client, request.location.lat, request.location.lon, window),
+        _soil(soilgrids, request, need_soil_properties),
     )
-    return series, list(range(window.inicio.year, window.fim.year)), soil
+    warnings = [warning for warning in (climate_warning, soil.warning) if warning]
+    return Inputs(series, season_years, soil, warnings)

@@ -140,3 +140,62 @@ def test_unidade_de_radiacao_inesperada(tmp_path: Path) -> None:
     client, _ = montar(tmp_path, lambda req, n: httpx.Response(200, json=bruto))
     with pytest.raises(RespostaInvalida, match="radiação"):
         asyncio.run(client.serie(-12.55, -55.72, JANELA))
+
+
+def _gravar(pasta: Path, lat: float, lon: float, janela: Janela) -> None:
+    pasta.mkdir(parents=True, exist_ok=True)
+    (pasta / chave_cache(lat, lon, janela.inicio, janela.fim)).write_text(
+        json.dumps(resposta_power(lat, lon))
+    )
+
+
+def test_nearest_cached_prefers_the_same_window_then_the_closest_cell(tmp_path: Path) -> None:
+    client, chamadas = montar(tmp_path, lambda req, n: httpx.Response(503))
+    outra = Janela(inicio=date(2015, 9, 1), fim=date(2015, 9, 5), safras=["2015/16"])
+    _gravar(tmp_path / "seed", -15.0, -50.0, outra)  # same cell, other window
+    _gravar(tmp_path / "cache", -18.0, -51.25, JANELA)
+    _gravar(tmp_path / "seed", -12.5, -55.625, JANELA)
+    serie = client.nearest_cached(-15.0, -50.0, JANELA)
+    assert serie is not None
+    assert (serie.lat, serie.lon) == (-18.0, -51.25)
+    assert serie.inicio == JANELA.inicio
+    assert chamadas == []
+
+
+def test_nearest_cached_falls_back_to_another_window(tmp_path: Path) -> None:
+    client, _ = montar(tmp_path, lambda req, n: httpx.Response(503))
+    outra = Janela(inicio=date(2015, 9, 1), fim=date(2015, 9, 5), safras=["2015/16"])
+    _gravar(tmp_path / "seed", -12.5, -55.625, outra)
+    serie = client.nearest_cached(-15.0, -50.0, JANELA)
+    assert serie is not None
+    assert (serie.lat, serie.lon) == (-12.5, -55.625)
+
+
+def test_nearest_cached_without_files_is_none(tmp_path: Path) -> None:
+    client, _ = montar(tmp_path, lambda req, n: httpx.Response(503))
+    assert client.nearest_cached(-15.0, -50.0, JANELA) is None
+
+
+def test_after_an_outage_calls_fail_fast_until_the_cooldown(tmp_path: Path) -> None:
+    import time
+
+    client, chamadas = montar(tmp_path, lambda req, n: httpx.Response(503))
+    client._breaker.cooldown_s = 0.2
+    with pytest.raises(PowerIndisponivel):
+        asyncio.run(client.serie(-12.5, -55.6, JANELA))
+    assert len(chamadas) == 3
+    with pytest.raises(PowerIndisponivel, match="recently"):
+        asyncio.run(client.serie(-15.0, -50.0, JANELA))
+    assert len(chamadas) == 3
+    time.sleep(0.25)
+    with pytest.raises(PowerIndisponivel):
+        asyncio.run(client.serie(-15.0, -50.0, JANELA))
+    assert len(chamadas) == 6
+
+
+def test_mark_unavailable_opens_the_breaker(tmp_path: Path) -> None:
+    client, chamadas = montar(tmp_path, lambda req, n: httpx.Response(503))
+    client.mark_unavailable()
+    with pytest.raises(PowerIndisponivel):
+        asyncio.run(client.serie(-12.5, -55.6, JANELA))
+    assert chamadas == []

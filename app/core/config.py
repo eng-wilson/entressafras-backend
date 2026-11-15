@@ -19,8 +19,14 @@ class Settings(BaseSettings):
     # Any origin: the API is public and uses no cookies or auth.
     cors_origins: list[str] = ["*"]
 
+    # External sources (POWER, SoilGrids) never block a rotation request for longer than this:
+    # past it the request answers from the nearest cached data, even from another region.
+    external_wait_budget_s: float = 25.0
+    # After an outage, skip the network of that source for this long (circuit breaker).
+    external_cooldown_s: float = 300.0
+
     power_base_url: str = "https://power.larc.nasa.gov"
-    power_timeout_s: float = 60.0
+    power_timeout_s: float = 20.0
     # Séries pré-baixadas e versionadas (demo sem rede); lidas antes do cache local.
     power_seed_dir: Path = APP_DIR / "data" / "power"
     # Cache local de respostas do POWER (fora do git).
@@ -28,7 +34,7 @@ class Settings(BaseSettings):
 
     # ISRIC SoilGrids 2.0 (textura do solo). API beta com uso justo de 5 chamadas/min.
     soilgrids_base_url: str = "https://rest.isric.org"
-    soilgrids_timeout_s: float = 90.0
+    soilgrids_timeout_s: float = 20.0
     soilgrids_min_interval_s: float = 12.0
     soilgrids_seed_dir: Path = APP_DIR / "data" / "soilgrids"
     soilgrids_cache_dir: Path = PROJECT_DIR / ".cache" / "soilgrids"
