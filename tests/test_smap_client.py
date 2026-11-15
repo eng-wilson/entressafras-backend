@@ -92,7 +92,8 @@ def montar(tmp_path: Path, buscar) -> tuple[SmapClient, list]:
         return buscar(*args)
 
     client = SmapClient(
-        seed_dir=tmp_path / "seed", cache_dir=tmp_path / "cache",
+        seed_dir=tmp_path / "seed",
+        cache_dir=tmp_path / "cache",
         buscar=registrar if buscar else None,
     )
     return client, chamadas
@@ -197,7 +198,11 @@ def test_fatias_mensais() -> None:
     t1 = datetime(2017, 1, 15, tzinfo=sc.FUSO)
     fatias = sc.fatias_mensais(t0, t1)
     assert [(a.month, b.month, b.day) for a, b in fatias] == [
-        (9, 10, 1), (10, 11, 1), (11, 12, 1), (12, 1, 1), (1, 1, 15)
+        (9, 10, 1),
+        (10, 11, 1),
+        (11, 12, 1),
+        (12, 1, 1),
+        (1, 1, 15),
     ]
 
 

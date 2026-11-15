@@ -62,3 +62,33 @@ O pacote CropWat é distribuído sob **AGPL-3.0 ou posterior** (David Dorchies, 
 condições antes de usar em produto fechado/comercial. Os valores vêm das tabelas do FAO-56. Cite:
 Allen, R. G. et al. (1998). Crop evapotranspiration: guidelines for computing crop water
 requirements. FAO Irrigation and Drainage Paper 56. Roma: FAO.
+
+# Dados: ISRIC SoilGrids 2.0 (`soilgrids/`)
+
+Respostas JSON brutas da [API REST do SoilGrids](https://rest.isric.org/soilgrids/v2.0/docs)
+(`/properties/query`: sand, silt, clay, soc; 0–100 cm), salvas por
+`scripts/download_soilgrids.py`. Nome: `soilgrids_v1_<lat>_<lon>.json` (4 casas decimais).
+
+- Semente de Sorriso-MT: o centro da cidade e os pontos a 2 km ao norte e a leste são área urbana
+  (valores `null`); o primeiro ponto com dados fica a 2 km ao sul (-12,568; -55,72).
+- Unidades brutas: g/kg (÷10 → %) e soc em dg/kg (÷10 → g/kg).
+
+Licença CC BY 4.0. Cite: Poggio, L. et al. (2021). SoilGrids 2.0: producing soil information for
+the globe with quantified spatial uncertainty. SOIL 7:217–240. doi:10.5194/soil-7-217-2021.
+
+# Dados: calendário agrícola GGCMI Phase 3 (`ggcmi/`)
+
+`ggcmi_phase3_v1.01_rf.npz` (numpy, compactado) reúne, para 8 culturas de sequeiro (soy, mai,
+sor, mil, cot, bea, sun, nut), a grade global de 0,5° do
+[GGCMI Phase 3 crop calendar v1.01](https://doi.org/10.5281/zenodo.5062513). Gerado por
+`uv run --with netCDF4 python -m scripts.build_ggcmi_calendar`.
+
+- Arrays: `lat`, `lon` e, por cultura, `<crop>_planting_day` (dia do ano), `<crop>_season_length`
+  (dias) e `<crop>_data_source` (1 MIRCA2000, 2 SAGE, … 8 Brazil CONAB); ausente = `-1`.
+- Em Sorriso (célula -12,75; -55,75): soja 31/out, 100 dias; milho 14/fev, 116 dias (safrinha);
+  ambos com dados da CONAB. O milheto vem do MIRCA2000 (180 dias), o que é pouco plausível para o
+  milheto safrinha de MT.
+
+Licença CC BY 4.0. Cite: Jägermeyr, J. et al. (2021). Climate impacts on global agriculture
+emerge earlier in new generation of climate and crop models. Nature Food 2:873–885.
+doi:10.1038/s43016-021-00400-y.

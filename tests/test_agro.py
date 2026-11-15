@@ -74,8 +74,17 @@ def _serie(safras: int, chuva=lambda d, s: 1.0, **sobrepor) -> list[DiaClima]:
     while d < date(2010 + safras, 9, 1):
         s = safra_de(d) - 2010
         valores = dict(
-            tmax=30.0 + s, tmin=20.0 - s, tdew=18.0, ur=70.0, vento=2.0, rad=20.0,
-            chuva=chuva(d, s), gwettop=0.5, gwetroot=0.6, et0=4.0, et0_metodo="pm-orvalho",
+            tmax=30.0 + s,
+            tmin=20.0 - s,
+            tdew=18.0,
+            ur=70.0,
+            vento=2.0,
+            rad=20.0,
+            chuva=chuva(d, s),
+            gwettop=0.5,
+            gwetroot=0.6,
+            et0=4.0,
+            et0_metodo="pm-orvalho",
         )
         valores.update({k: f(d, s) for k, f in sobrepor.items()})
         dias.append(DiaClima(data=d, **valores))
@@ -123,8 +132,14 @@ def test_menos_da_metade_dos_dias_descarta_a_safra() -> None:
 
 def test_mesclar_smap_por_data() -> None:
     dias = _serie(1)[:3]
-    smap = {dias[1].data: {"sm_surface": 0.2, "sm_rootzone": 0.3,
-                           "sm_rootzone_wetness": 0.6, "sm_rootzone_pctl": 40.0}}
+    smap = {
+        dias[1].data: {
+            "sm_surface": 0.2,
+            "sm_rootzone": 0.3,
+            "sm_rootzone_wetness": 0.6,
+            "sm_rootzone_pctl": 40.0,
+        }
+    }
     mesclados = mesclar_smap(dias, smap)
     assert mesclados[0].sm_rootzone is None
     assert mesclados[1].sm_rootzone == 0.3 and mesclados[1].chuva == dias[1].chuva
@@ -133,8 +148,11 @@ def test_mesclar_smap_por_data() -> None:
 
 def test_decendios_com_umidade_smap() -> None:
     dias = _serie(
-        10, sm_surface=lambda d, s: 0.2, sm_rootzone=lambda d, s: 0.25 + s / 100,
-        sm_rootzone_wetness=lambda d, s: 0.5, sm_rootzone_pctl=lambda d, s: 10.0 * s,
+        10,
+        sm_surface=lambda d, s: 0.2,
+        sm_rootzone=lambda d, s: 0.25 + s / 100,
+        sm_rootzone_wetness=lambda d, s: 0.5,
+        sm_rootzone_pctl=lambda d, s: 10.0 * s,
     )
     r = agregar_decendios(dias)[0]
     assert r.sm_surface_media == 0.2

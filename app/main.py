@@ -11,6 +11,7 @@ from app.api.router import api_router
 from app.core.config import get_settings
 from app.services.power_client import PowerClient
 from app.services.smap_client import SmapClient, SmapIndisponivel, buscar_ee, inicializar_ee
+from app.services.soilgrids_client import SoilGridsClient
 
 settings = get_settings()
 log = logging.getLogger(__name__)
@@ -35,12 +36,22 @@ async def _checar_earth_engine() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    async with httpx.AsyncClient(timeout=settings.power_timeout_s) as http:
+    async with (
+        httpx.AsyncClient(timeout=settings.power_timeout_s) as http,
+        httpx.AsyncClient(timeout=settings.soilgrids_timeout_s) as soilgrids_http,
+    ):
         app.state.power_client = PowerClient(
             http,
             base_url=settings.power_base_url,
             seed_dir=settings.power_seed_dir,
             cache_dir=settings.power_cache_dir,
+        )
+        app.state.soilgrids_client = SoilGridsClient(
+            soilgrids_http,
+            base_url=settings.soilgrids_base_url,
+            seed_dir=settings.soilgrids_seed_dir,
+            cache_dir=settings.soilgrids_cache_dir,
+            min_interval_s=settings.soilgrids_min_interval_s,
         )
         app.state.ee_status = await _checar_earth_engine()
         app.state.smap_client = SmapClient(

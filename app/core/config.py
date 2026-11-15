@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     # Cache local de respostas do POWER (fora do git).
     power_cache_dir: Path = PROJECT_DIR / ".cache" / "power"
 
+    # ISRIC SoilGrids 2.0 (textura do solo). API beta com uso justo de 5 chamadas/min.
+    soilgrids_base_url: str = "https://rest.isric.org"
+    soilgrids_timeout_s: float = 90.0
+    soilgrids_min_interval_s: float = 12.0
+    soilgrids_seed_dir: Path = APP_DIR / "data" / "soilgrids"
+    soilgrids_cache_dir: Path = PROJECT_DIR / ".cache" / "soilgrids"
+
     # Google Earth Engine (umidade do solo SMAP L4). Sem projeto nem chave, só lê semente/cache.
     ee_project: str | None = None
     # JSON da conta de serviço registrada no Earth Engine; sem ele, usa `earthengine authenticate`.
@@ -44,9 +51,7 @@ class Settings(BaseSettings):
 
     @property
     def ee_configurado(self) -> bool:
-        return bool(
-            self.ee_project or self.ee_service_account_key or self.ee_service_account_json
-        )
+        return bool(self.ee_project or self.ee_service_account_key or self.ee_service_account_json)
 
 
 @lru_cache

@@ -23,8 +23,15 @@ JANELA = Janela(inicio=date(2016, 9, 1), fim=date(2016, 9, 5), safras=["2016/17"
 def resposta_power(lat=-12.5, lon=-55.625, unidade_rad="MJ/m^2/day", fill_em=None) -> dict:
     datas = [f"{JANELA.inicio + timedelta(days=i):%Y%m%d}" for i in range(5)]
     valores = {
-        "T2M_MAX": 32.0, "T2M_MIN": 18.0, "T2MDEW": 12.0, "RH2M": 50.0, "WS2M": 1.5,
-        "ALLSKY_SFC_SW_DWN": 20.0, "PRECTOTCORR": 0.0, "GWETTOP": 0.3, "GWETROOT": 0.5,
+        "T2M_MAX": 32.0,
+        "T2M_MIN": 18.0,
+        "T2MDEW": 12.0,
+        "RH2M": 50.0,
+        "WS2M": 1.5,
+        "ALLSKY_SFC_SW_DWN": 20.0,
+        "PRECTOTCORR": 0.0,
+        "GWETTOP": 0.3,
+        "GWETROOT": 0.5,
     }
     param = {p: {d: v for d in datas} for p, v in valores.items()}
     if fill_em:
@@ -32,8 +39,9 @@ def resposta_power(lat=-12.5, lon=-55.625, unidade_rad="MJ/m^2/day", fill_em=Non
     return {
         "geometry": {"type": "Point", "coordinates": [lon, lat, 370.0]},
         "properties": {"parameter": param},
-        "parameters": {p: {"units": unidade_rad if p == "ALLSKY_SFC_SW_DWN" else "x"}
-                       for p in PARAMETROS},
+        "parameters": {
+            p: {"units": unidade_rad if p == "ALLSKY_SFC_SW_DWN" else "x"} for p in PARAMETROS
+        },
         "header": {"fill_value": -999.0},
     }
 
@@ -47,8 +55,11 @@ def montar(tmp_path: Path, handler) -> tuple[PowerClient, list[httpx.Request]]:
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(registrar))
     client = PowerClient(
-        http, base_url="https://power.test", seed_dir=tmp_path / "seed",
-        cache_dir=tmp_path / "cache", backoff_s=(0.0,),
+        http,
+        base_url="https://power.test",
+        seed_dir=tmp_path / "seed",
+        cache_dir=tmp_path / "cache",
+        backoff_s=(0.0,),
     )
     return client, chamadas
 
@@ -65,6 +76,12 @@ def test_janela_safras() -> None:
     assert j.safras[0] == "2016/17" and j.safras[-1] == "2025/26" and len(j.safras) == 10
     # Antes de 30 dias do fim de agosto, a safra que acabou de fechar ainda não entra.
     assert janela_safras(date(2026, 9, 15)).fim == date(2025, 8, 31)
+
+
+def test_janela_safras_com_mais_safras() -> None:
+    j = janela_safras(date(2026, 11, 14), n_safras=30)
+    assert (j.inicio, j.fim) == (date(1996, 9, 1), date(2026, 8, 31))
+    assert j.safras[0] == "1996/97" and j.safras[-1] == "2025/26" and len(j.safras) == 30
 
 
 def test_busca_grava_cache_e_reusa(tmp_path: Path) -> None:

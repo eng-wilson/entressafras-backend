@@ -75,22 +75,18 @@ def diario(cabecalho: Sequence[str], linhas: Sequence[Sequence], inicio: date, f
     """
     try:
         i_tempo = cabecalho.index("time")
-        i_lat, i_lon = cabecalho.index(
-            "latitude"), cabecalho.index("longitude")
+        i_lat, i_lon = cabecalho.index("latitude"), cabecalho.index("longitude")
         i_bandas = [cabecalho.index(b) for b in CAMPOS_SMAP]
     except ValueError as exc:
-        raise SmapRespostaInvalida(
-            f"coluna ausente no getRegion: {exc}") from exc
+        raise SmapRespostaInvalida(f"coluna ausente no getRegion: {exc}") from exc
 
     grupos: dict[date, list[Sequence]] = {}
     for linha in linhas:
-        local = datetime.fromtimestamp(
-            linha[i_tempo] / 1000, tz=UTC).astimezone(FUSO)
+        local = datetime.fromtimestamp(linha[i_tempo] / 1000, tz=UTC).astimezone(FUSO)
         if inicio <= local.date() <= fim:
             grupos.setdefault(local.date(), []).append(linha)
     if not grupos:
-        raise SmapRespostaInvalida(
-            "Earth Engine devolveu série vazia para o ponto")
+        raise SmapRespostaInvalida("Earth Engine devolveu série vazia para o ponto")
 
     dias: dict[str, list[float | None]] = {}
     for dia in sorted(grupos):
@@ -120,11 +116,9 @@ def interpretar(bruto: dict) -> SerieSmap:
             for d, v in bruto["dias"].items()
         }
     except (KeyError, TypeError, ValueError) as exc:
-        raise SmapRespostaInvalida(
-            f"JSON do SMAP sem campo esperado: {exc}") from exc
+        raise SmapRespostaInvalida(f"JSON do SMAP sem campo esperado: {exc}") from exc
     if list(bandas) != list(CAMPOS_SMAP):
-        raise SmapRespostaInvalida(
-            f"bandas {bandas}, esperado {list(CAMPOS_SMAP)}")
+        raise SmapRespostaInvalida(f"bandas {bandas}, esperado {list(CAMPOS_SMAP)}")
     if not dias:
         raise SmapRespostaInvalida("série SMAP vazia")
     return SerieSmap(lat=lat, lon=lon, inicio=min(dias), fim=max(dias), dias=dias)
@@ -143,9 +137,7 @@ def _ler_chave_json(valor: str) -> dict:
         try:
             texto = base64.b64decode(texto, validate=True).decode("utf-8")
         except ValueError:  # inclui binascii.Error, não-ASCII e UnicodeDecodeError
-            raise SmapIndisponivel(
-                "EE_SERVICE_ACCOUNT_JSON não é JSON nem base64 válido"
-            ) from None
+            raise SmapIndisponivel("EE_SERVICE_ACCOUNT_JSON não é JSON nem base64 válido") from None
     try:
         info = json.loads(texto)
     except json.JSONDecodeError:
@@ -330,8 +322,7 @@ class SmapClient:
 
     async def _remoto(self, lat: float, lon: float, janela: Janela) -> dict:
         if self._buscar is None:
-            raise SmapIndisponivel(
-                "Earth Engine não configurado (EE_PROJECT) e sem semente/cache")
+            raise SmapIndisponivel("Earth Engine não configurado (EE_PROJECT) e sem semente/cache")
         lat_p, lon_p = pixel(lat, lon)
         return await asyncio.to_thread(self._buscar, lat_p, lon_p, janela.inicio, janela.fim)
 
@@ -342,14 +333,12 @@ class SmapClient:
                 try:
                     return json.loads(arquivo.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
-                    log.warning(
-                        "cache do SMAP ilegível, ignorando: %s", arquivo)
+                    log.warning("cache do SMAP ilegível, ignorando: %s", arquivo)
         return None
 
     @staticmethod
     def _gravar(arquivo: Path, bruto: dict) -> None:
         arquivo.parent.mkdir(parents=True, exist_ok=True)
         tmp = arquivo.with_suffix(".tmp")
-        tmp.write_text(json.dumps(bruto, separators=(",", ":")),
-                       encoding="utf-8")
+        tmp.write_text(json.dumps(bruto, separators=(",", ":")), encoding="utf-8")
         tmp.replace(arquivo)

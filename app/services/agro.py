@@ -35,7 +35,11 @@ def radiacao_extraterrestre(lat: float, doy: int) -> float:
     delta = 0.409 * math.sin(2 * math.pi * doy / 365 - 1.39)
     ws = math.acos(max(-1.0, min(1.0, -math.tan(phi) * math.tan(delta))))
     return (
-        24 * 60 / math.pi * GSC * dr
+        24
+        * 60
+        / math.pi
+        * GSC
+        * dr
         * (ws * math.sin(phi) * math.sin(delta) + math.cos(phi) * math.cos(delta) * math.sin(ws))
     )
 

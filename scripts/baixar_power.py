@@ -2,7 +2,8 @@
 
 A semente deixa a demo funcionar sem rede e evita repetir consultas à NASA.
 
-Uso: uv run python -m scripts.baixar_power [lat lon]   (padrão: Sorriso-MT, -12.55 -55.72)
+Uso: uv run python -m scripts.baixar_power [--safras N] [lat lon]
+     (padrão: Sorriso-MT, -12.55 -55.72, N_SAFRAS safras; as rotações usam 30)
 """
 
 import asyncio
@@ -12,14 +13,14 @@ import sys
 import httpx
 
 from app.core.config import get_settings
-from app.services.power_client import PowerClient, celula, interpretar, janela_safras
+from app.services.power_client import N_SAFRAS, PowerClient, celula, interpretar, janela_safras
 
 SORRISO = (-12.55, -55.72)
 
 
-async def main(lat: float, lon: float) -> None:
+async def main(lat: float, lon: float, n_safras: int = N_SAFRAS) -> None:
     settings = get_settings()
-    janela = janela_safras()
+    janela = janela_safras(n_safras=n_safras)
     print(f"NASA POWER {lat}, {lon} → célula {celula(lat, lon)} · {janela.inicio} a {janela.fim}")
     async with httpx.AsyncClient(timeout=settings.power_timeout_s) as http:
         client = PowerClient(
@@ -48,7 +49,10 @@ async def main(lat: float, lon: float) -> None:
 
 if __name__ == "__main__":
     args = sys.argv[1:]
+    n_safras = N_SAFRAS
+    if args[:1] == ["--safras"] and len(args) >= 2:
+        n_safras, args = int(args[1]), args[2:]
     if len(args) not in (0, 2):
-        sys.exit("uso: uv run python -m scripts.baixar_power [lat lon]")
+        sys.exit("uso: uv run python -m scripts.baixar_power [--safras N] [lat lon]")
     lat, lon = (float(args[0]), float(args[1])) if args else SORRISO
-    asyncio.run(main(lat, lon))
+    asyncio.run(main(lat, lon, n_safras))

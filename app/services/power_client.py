@@ -19,6 +19,7 @@ from app.services.agro import DiaClima, et0_dia, rotulo_safra
 
 log = logging.getLogger(__name__)
 
+# Padrão da rota /clima: o SMAP só existe a partir de 2015. As rotações pedem mais safras.
 N_SAFRAS = 10
 GRADE_LAT = 0.5
 GRADE_LON = 0.625
@@ -65,11 +66,11 @@ class Janela:
     safras: list[str]
 
 
-def janela_safras(hoje: date | None = None) -> Janela:
-    """As N_SAFRAS últimas safras completas (1º/set a 31/ago) encerradas há ≥ CARENCIA."""
+def janela_safras(hoje: date | None = None, n_safras: int = N_SAFRAS) -> Janela:
+    """As `n_safras` últimas safras completas (1º/set a 31/ago) encerradas há ≥ CARENCIA."""
     hoje = hoje or date.today()
     ano_fim = hoje.year if hoje - date(hoje.year, 8, 31) >= CARENCIA else hoje.year - 1
-    ano_ini = ano_fim - N_SAFRAS
+    ano_ini = ano_fim - n_safras
     return Janela(
         inicio=date(ano_ini, 9, 1),
         fim=date(ano_fim, 8, 31),
@@ -115,8 +116,15 @@ def interpretar(bruto: dict, lat_c: float, lon_c: float) -> SerieDiaria:
         v = {nome: _valor(params[p].get(chave)) for p, nome in PARAMETROS.items()}
         d = datetime.strptime(chave, "%Y%m%d").date()
         et0, metodo = et0_dia(
-            data=d, tmax=v["tmax"], tmin=v["tmin"], tdew=v["tdew"], ur=v["ur"],
-            u2=v["vento"], rs=v["rad"], elev=elev, lat=lat_c,
+            data=d,
+            tmax=v["tmax"],
+            tmin=v["tmin"],
+            tdew=v["tdew"],
+            ur=v["ur"],
+            u2=v["vento"],
+            rs=v["rad"],
+            elev=elev,
+            lat=lat_c,
         )
         dias.append(DiaClima(data=d, et0=et0, et0_metodo=metodo, **v))
     if not dias:

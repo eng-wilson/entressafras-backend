@@ -1,14 +1,26 @@
-"""Two-crop rotation recommendations.
+"""Two-crop rotation recommendations from a simplified FAO-56 daily water balance.
 
-For now the ranking is MOCKED (fixed sequences and risk values) so the frontend can integrate
-against the final contract. Crop data and planting/harvest dates are real: crops come from the
-EcoCrop + CROPWAT repository and dates follow each crop's FAO-56 cycle length.
+For each ordered pair of candidate crops (A then B, different botanical families) and each
+planting date of A, both crops are simulated in every historical season (`water_balance`).
+Planting dates and cycle lengths follow the regional GGCMI crop calendar (`crop_calendar`): A is
+planted around its calendar date, and B (right after the harvest of A) only when that date is
+close to its own calendar date. Each
+crop gets its own risk (`crop_risk`); pairs are ranked by the worse of the two individual risks.
+There is deliberately no combined rotation risk. Climate is the historical record used as a set of
+scenarios, not a forecast.
 """
 
+import statistics
+import threading
+from bisect import bisect_left, bisect_right
+from collections import Counter, OrderedDict
+from collections.abc import Hashable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, timedelta
 
-from app.schemas.crop import CropDetail
+from app.schemas.crop import CropDetail, WaterRequirements
 from app.schemas.rotation import (
+    CropCalendarInfo,
     CropRisk,
     CropWithRisk,
     MeanIsna,
@@ -17,41 +29,129 @@ from app.schemas.rotation import (
     RotationCrop,
     RotationRecommendationsResponse,
     RotationRequest,
+    SoilInfo,
+    SoilProperties,
+    Stage,
+)
+from app.schemas.rotation import Location as LocationSchema
+from app.services.agro import MIN_SAFRAS_VALIDAS, DiaClima
+from app.services.crop_calendar import (
+    CALENDAR_SOURCE,
+    CropCalendar,
+    apply_calendar,
+    crop_calendars,
 )
 from app.services.ecocrop import CropRepository
+from app.services.soil import SoilProfile, SoilType, saxton_rawls_2006, texture_class
+from app.services.soil_protection import soil_protection
+from app.services.soilgrids_client import ORGANIC_MATTER_PER_CARBON, SoilEstimate
+from app.services.water_balance import STAGES, CropSeasonResult, SoilCarryOver, simulate_phases
 
+# TODO(validate): product choice, not an FAO norm; calibrate per crop and region (follow-up 2).
 LOSS_THRESHOLD_PCT = 20.0
+# TODO(validate): hypothesis, not measured; see scripts/rotation_sensitivity.py and compare with
+# GWETROOT/SMAP (follow-up 7).
 INITIAL_SOIL_WATER_FRACTION = 0.2
+# Initial soil water fractions compared by scripts/rotation_sensitivity.py. Not run per request:
+# each ranking takes about 2 s on 10 seasons.
+SENSITIVITY_WATER_FRACTIONS = (0.2, 0.5, 0.8)
+# TODO(validate): spin-up, season start and planting window are set for Mato Grosso; detect the
+# onset of the rainy season per region instead (follow-up 3).
 SPINUP_DAYS = 30
+SEASON_START = (9, 1)  # month, day
+SEASON_END = (8, 31)
+# Planting window of crop A when it has no regional calendar (month, day).
+PLANTING_WINDOW_A = ((10, 1), (11, 30))
+PLANTING_STEP_DAYS = 10
+# Planting dates within this distance of the calendar date are accepted: crop A is tried every
+# PLANTING_STEP_DAYS inside ± this window, and crop B only when its date falls inside it.
+# TODO(validate): product choice; GGCMI gives one average date per cell, while farmers spread
+# planting over 1–2 months (e.g. second-season maize in MT from January to March).
+PLANTING_TOLERANCE_DAYS = 30
+# Free days between the harvest of A and the planting of B (B is planted on harvest + 6 days).
+# TODO(validate): the original plan says "harvest + 5"; confirm whether 5 means the free days
+# (current behavior) or the date offset.
 PLANTING_GAP_DAYS = 5
 MAX_ROTATIONS = 4
-SEASON_START = (9, 1)  # month, day
-MOCK_PLANTING_A = (10, 15)
+MIN_SEASONS_FOR_STABLE_RISK = 15
+# Historical seasons simulated per request. ZARC uses 30 years (Portaria SPA/MAPA nº 326/2026,
+# item 1.11), and so does the WMO climate normal.
+ROTATION_SEASONS = 30
+RANKING_CACHE_SIZE = 64
 
 SOYBEAN, MAIZE, SORGHUM, MILLET, COTTON = 1150, 2175, 48747, 8418, 1160
-MOCK_SEQUENCES: list[tuple[int, int]] = [
-    (SOYBEAN, MAIZE),
-    (SOYBEAN, SORGHUM),
-    (SOYBEAN, MILLET),
-    (SOYBEAN, COTTON),
-]
+COMMON_BEAN, COWPEA, SUNFLOWER, GROUNDNUT = 1668, 2153, 1191, 2199
+# Candidate crops for the second-season rotation (EcoCrop codes with FAO-56 CROPWAT profiles).
+# TODO(pending): the only agronomic rule is "different botanical family"; pests, diseases,
+# nematodes, straw, nutrients, yield and economics are not considered (follow-up 10).
+ROTATION_CROP_CODES: tuple[int, ...] = (
+    SOYBEAN,
+    MAIZE,
+    SORGHUM,
+    MILLET,
+    COTTON,
+    COMMON_BEAN,
+    COWPEA,
+    SUNFLOWER,
+    GROUNDNUT,
+)
 
-# Placeholder values, only to exercise the contract. (risk %, loss %, critical stage, ISNA by stage)
-_MOCK_RISK: dict[int, tuple[float, float, str, tuple[float, float, float, float]]] = {
-    SOYBEAN: (10.0, 6.0, "mid_season", (0.95, 0.9, 0.84, 0.8)),
-    MAIZE: (30.0, 14.5, "mid_season", (0.9, 0.78, 0.66, 0.6)),
-    SORGHUM: (20.0, 9.0, "mid_season", (0.92, 0.82, 0.72, 0.65)),
-    MILLET: (20.0, 8.0, "development", (0.9, 0.7, 0.75, 0.7)),
-    COTTON: (40.0, 18.0, "mid_season", (0.95, 0.8, 0.6, 0.5)),
-}
-
-MOCK_WARNING = (
-    "MOCK: ranking and risk values are placeholders for contract integration; "
-    "they are not computed from climate data."
+EXPERIMENTAL_WARNING = (
+    "Experimental method (simplified FAO-56 daily water balance with seasonal Ky, FAO-33); "
+    "not validated against the official ZARC agricultural zoning."
+)
+INITIAL_WATER_WARNING = (
+    "Soil water at the start of the simulation is assumed to be "
+    f"{INITIAL_SOIL_WATER_FRACTION:.0%} of the available water capacity (hypothesis, not "
+    "measured)."
+)
+GRID_WARNING = (
+    "Climate comes from a NASA POWER grid cell of about 50 km; local rainfall can differ."
+)
+# TODO(validate): one average date and length per 0.5° cell, not per cultivar (early, medium
+# and late maturity groups differ by weeks); compare with ZARC cycles in Brazil (follow-up 4).
+CALENDAR_WARNING = (
+    "Planting dates and cycle lengths come from the GGCMI Phase 3 crop calendar (0.5° grid, "
+    "regional averages from national statistics or MIRCA2000/SAGE); FAO-56 stage proportions "
+    "are stretched to that cycle. Your cultivar's cycle may differ."
 )
 CYCLE_WARNING = (
-    "Crop cycle lengths are FAO-56 reference values, not calibrated for Brazilian cultivars; "
-    "harvest dates may be earlier than in practice."
+    "No regional calendar for {crops}: FAO-56 reference cycle lengths and the default "
+    "October–November planting window are used, not calibrated for the region."
+)
+# TODO(validate): fixed text backed by scripts/rotation_sensitivity.py on the Sorriso seed only
+# with GGCMI calendars (top 4 changed with the initial water on the 80/150/160 mm/m classes, where
+# top risks are close; stable on the SoilGrids estimate of 104 mm/m). Re-run for other regions.
+SENSITIVITY_WARNING = (
+    "Rotations with near-zero risk are practically tied: their order changes with the initial "
+    "soil water assumption (20%, 50% or 80% of capacity), so treat close ranks as equivalent."
+)
+SOILGRIDS_WARNING = (
+    "Soil estimated from the location: SoilGrids 250 m texture (machine-learning map) and the "
+    "Saxton & Rawls (2006) pedotransfer function. Confirm with a soil analysis of the field."
+)
+SOIL_CLASS_WARNING = (
+    "Soil water comes from a generic texture class, not from the field; omit soil_type to "
+    "estimate it from the location."
+)
+SOIL_PROTECTION_WARNING = (
+    "soil_protection is a planning index: 70 × share of the season with a planned living crop + "
+    "30 × share of crop transitions that change botanical family (heuristic weights). It is not "
+    "a measurement of soil health nor a forecast of organic matter, and it does not change the "
+    "ranking."
+)
+NO_HISTORY_WARNING = (
+    "Without crop_history only the A→B transition is counted; recommended rotations always "
+    "change family, so the diversity part of soil_protection is always full."
+)
+SOIL_PROPERTIES_WARNING = (
+    "soil_properties are SoilGrids 250 m estimates (0–30 cm, machine-learning maps); they do "
+    "not replace a laboratory soil analysis."
+)
+SOIL_PROPERTIES_UNAVAILABLE_WARNING = "Soil properties panel unavailable: {reason}."
+TEMPERATURE_FILTER_WARNING = (
+    "Crops are pre-filtered by EcoCrop absolute temperature limits against the mean daily "
+    "minimum/maximum over the cycle (coarse filter)."
 )
 
 
@@ -60,85 +160,624 @@ def next_agricultural_year(today: date) -> int:
     return today.year if today < date(today.year, *SEASON_START) else today.year + 1
 
 
-def harvest_date(planting: date, crop: CropDetail) -> date:
+def season_of(day: date) -> int:
+    """Start year of the season (Sep 1 – Aug 31) that contains `day`."""
+    return day.year if day >= date(day.year, *SEASON_START) else day.year - 1
+
+
+def harvest_date(planting_date: date, crop: CropDetail) -> date:
     """Last day of the crop cycle (planting day counts as day 1)."""
-    return planting + timedelta(days=_cycle_days(crop) - 1)
+    return planting_date + timedelta(days=_cycle_days(crop) - 1)
+
+
+def second_planting_date(first_harvest_date: date) -> date:
+    """Planting date of crop B, leaving PLANTING_GAP_DAYS free days after the harvest of A."""
+    return first_harvest_date + timedelta(days=PLANTING_GAP_DAYS + 1)
 
 
 def _cycle_days(crop: CropDetail) -> int:
+    return _water_requirements(crop).stage_length_days.total
+
+
+def _water_requirements(crop: CropDetail) -> WaterRequirements:
     if crop.water_requirements is None:
         raise ValueError(f"crop {crop.eco_port_code} has no water requirements")
-    return crop.water_requirements.stage_length_days.total
+    return crop.water_requirements
 
 
-def _mock_risk(code: int) -> CropRisk:
-    risk_pct, loss, stage, isna = _MOCK_RISK[code]
-    return CropRisk(
-        risk_percentage=risk_pct,
-        estimated_yield_loss_pct=loss,
-        loss_threshold_pct=LOSS_THRESHOLD_PCT,
-        critical_stage=stage,
-        mean_isna=MeanIsna(
-            initial=isna[0], development=isna[1], mid_season=isna[2], late_season=isna[3]
-        ),
-        valid_years=10,
-        method="MOCK",
+def first_planting_dates(
+    agricultural_year: int, calendar: CropCalendar | None = None
+) -> list[date]:
+    """Planting dates of crop A, every PLANTING_STEP_DAYS.
+
+    Around the calendar date (± PLANTING_TOLERANCE_DAYS, inside the season) when there is one,
+    otherwise inside PLANTING_WINDOW_A.
+    """
+    if calendar is None:
+        (first_month, first_day), (last_month, last_day) = PLANTING_WINDOW_A
+        planting_date = date(agricultural_year, first_month, first_day)
+        last_date = date(agricultural_year, last_month, last_day)
+    else:
+        reference = calendar.planting_date(agricultural_year)
+        tolerance = timedelta(days=PLANTING_TOLERANCE_DAYS)
+        planting_date = max(reference - tolerance, date(agricultural_year, *SEASON_START))
+        last_date = min(reference + tolerance, date(agricultural_year + 1, *SEASON_END))
+    dates = []
+    while planting_date <= last_date:
+        dates.append(planting_date)
+        planting_date += timedelta(days=PLANTING_STEP_DAYS)
+    return dates
+
+
+def fits_calendar(planting_date: date, calendar: CropCalendar | None) -> bool:
+    """Planting date close enough to the regional calendar date (always true without one)."""
+    return calendar is None or calendar.days_from_planting(planting_date) <= PLANTING_TOLERANCE_DAYS
+
+
+def calendar_info(
+    crop: CropDetail, calendar: CropCalendar | None, agricultural_year: int
+) -> CropCalendarInfo:
+    if calendar is None:
+        return CropCalendarInfo(source="FAO56_REFERENCE", cycle_days=_cycle_days(crop))
+    return CropCalendarInfo(
+        source=CALENDAR_SOURCE,
+        cycle_days=calendar.season_length_days,
+        reference_planting_date=calendar.planting_date(agricultural_year),
+        data_source=calendar.data_source,
+        grid_cell=LocationSchema(lat=calendar.cell_lat, lon=calendar.cell_lon),
     )
 
 
-def _rotation_crop(crop: CropDetail, risk: CropRisk, planting: date) -> RotationCrop:
+# --- Risk per crop --------------------------------------------------------------------------
+
+
+def _round(value: float | None, digits: int) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+def _mean(values: Sequence[float]) -> float | None:
+    return statistics.fmean(values) if values else None
+
+
+def crop_risk(
+    results: Sequence[CropSeasonResult], threshold_pct: float = LOSS_THRESHOLD_PCT
+) -> CropRisk:
+    """Aggregate one crop's simulated seasons into its individual water risk.
+
+    Only valid seasons with a computable loss count. With fewer than MIN_SAFRAS_VALIDAS of them,
+    every indicator is None (unknown, which is not the same as low risk).
+    """
+    valid = [
+        result for result in results if result.is_valid and result.yield_loss_fraction is not None
+    ]
+    if len(valid) < MIN_SAFRAS_VALIDAS:
+        return CropRisk(
+            risk_percentage=None,
+            estimated_yield_loss_pct=None,
+            loss_threshold_pct=threshold_pct,
+            critical_stage=None,
+            mean_isna=MeanIsna(initial=None, development=None, mid_season=None, late_season=None),
+            valid_years=len(valid),
+            method="FAO56_SIMPLIFIED_KY",
+        )
+
+    losses_pct = [100 * result.yield_loss_fraction for result in valid]
+    critical_seasons = sum(loss_pct > threshold_pct for loss_pct in losses_pct)
+    mean_isna = {
+        stage: _round(
+            _mean(
+                [
+                    satisfaction
+                    for result in valid
+                    if (satisfaction := result.water_satisfaction_index.get(stage)) is not None
+                ]
+            ),
+            3,
+        )
+        for stage in STAGES
+    }
+    return CropRisk(
+        risk_percentage=round(100 * critical_seasons / len(valid), 1),
+        estimated_yield_loss_pct=round(statistics.fmean(losses_pct), 1),
+        loss_threshold_pct=threshold_pct,
+        critical_stage=_most_common_stage(valid),
+        mean_isna=MeanIsna(**mean_isna),
+        valid_years=len(valid),
+        method="FAO56_SIMPLIFIED_KY",
+    )
+
+
+def _most_common_stage(results: Sequence[CropSeasonResult]) -> Stage | None:
+    """Mode of the critical stage across seasons; ties go to the earlier stage."""
+    counts = Counter(result.critical_stage for result in results if result.critical_stage)
+    if not counts:
+        return None
+    return max(STAGES, key=lambda stage: (counts[stage], -STAGES.index(stage)))
+
+
+# --- Candidates and ranking -----------------------------------------------------------------
+
+
+def rank_key(
+    risk_a: CropRisk, risk_b: CropRisk, planting_date: date, crop_codes: tuple[int, int]
+) -> tuple:
+    """Lowest worst individual risk first; unknown risk sorts last. No combined risk is exposed."""
+    risk_percentages = [risk.risk_percentage for risk in (risk_a, risk_b)]
+    yield_losses = [risk.estimated_yield_loss_pct for risk in (risk_a, risk_b)]
+    if None in risk_percentages or None in yield_losses:
+        return (1, 0.0, 0.0, 0.0, planting_date, crop_codes)
+    return (
+        0,
+        max(risk_percentages),
+        max(yield_losses),
+        sum(yield_losses),
+        planting_date,
+        crop_codes,
+    )
+
+
+@dataclass(frozen=True)
+class RankedRotation:
+    ranking_key: tuple
+    first: RotationCrop
+    second: RotationCrop
+
+    @property
+    def crop_codes(self) -> tuple[int, int]:
+        return self.first.crop.eco_port_code, self.second.crop.eco_port_code
+
+
+class _Climate:
+    """Historical daily climate sorted by date, with fast date-range slicing."""
+
+    def __init__(self, climate_days: Sequence[DiaClima]) -> None:
+        self.days = sorted(climate_days, key=lambda climate_day: climate_day.data)
+        self.dates = [climate_day.data for climate_day in self.days]
+
+    def between(self, first_day: date, last_day: date) -> list[DiaClima]:
+        return self.days[bisect_left(self.dates, first_day) : bisect_right(self.dates, last_day)]
+
+
+def _shift_to_season(projected_date: date, agricultural_year: int, season_year: int) -> date:
+    """Same day and month in another season (Feb 29 becomes Feb 28)."""
+    year = projected_date.year - agricultural_year + season_year
+    try:
+        return projected_date.replace(year=year)
+    except ValueError:
+        return projected_date.replace(year=year, day=28)
+
+
+def _mean_temperatures(days: Sequence[DiaClima]) -> tuple[float | None, float | None]:
+    minimums = [day.tmin for day in days if day.tmin is not None]
+    maximums = [day.tmax for day in days if day.tmax is not None]
+    return _mean(minimums), _mean(maximums)
+
+
+def _temperature_suitable(
+    crop: CropDetail,
+    planting_date: date,
+    climate: _Climate,
+    agricultural_year: int,
+    season_years: Sequence[int],
+) -> bool:
+    """Coarse EcoCrop filter: mean daily Tmin/Tmax over the cycle within the absolute limits.
+
+    TODO(validate): the plan compared daily extremes, but in Sorriso the October daily Tmax
+    reaches 42 °C, above soybean's 38 °C absolute maximum, which would exclude soybean exactly
+    where it is grown. EcoCrop limits are meant for monthly means, so the cycle mean is used.
+    """
+    cycle_days = []
+    for season_year in season_years:
+        start = _shift_to_season(planting_date, agricultural_year, season_year)
+        cycle_days.extend(climate.between(start, harvest_date(start, crop)))
+    mean_minimum, mean_maximum = _mean_temperatures(cycle_days)
+    limits = crop.temperature
+    if limits.absolute_min is not None and mean_minimum is not None:
+        if mean_minimum < limits.absolute_min:
+            return False
+    if limits.absolute_max is not None and mean_maximum is not None:
+        if mean_maximum > limits.absolute_max:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class _FirstCropSeason:
+    result: CropSeasonResult
+    harvest_date: date
+    carry_over: SoilCarryOver  # soil water at the end of the harvest day
+
+
+def _simulate_first_crop(
+    crop: CropDetail,
+    planting_date: date,
+    climate: _Climate,
+    agricultural_year: int,
+    season_years: Sequence[int],
+    soil: SoilProfile | SoilType,
+    initial_water_fraction: float,
+) -> list[_FirstCropSeason]:
+    """Spin-up fallow + crop A in every season. Independent of crop B, so it is shared."""
+    seasons = []
+    for season_year in season_years:
+        planting = _shift_to_season(planting_date, agricultural_year, season_year)
+        harvest = harvest_date(planting, crop)
+        simulation_start = max(
+            date(season_year, *SEASON_START), planting - timedelta(days=SPINUP_DAYS)
+        )
+        [result], carry_over = simulate_phases(
+            climate.between(simulation_start, harvest),
+            simulation_start,
+            [(_water_requirements(crop), planting)],
+            soil,
+            initial_water_fraction,
+        )
+        seasons.append(_FirstCropSeason(result, harvest, carry_over))
+    return seasons
+
+
+def _simulate_second_crop(
+    crop: CropDetail,
+    first_seasons: Sequence[_FirstCropSeason],
+    climate: _Climate,
+    soil: SoilProfile | SoilType,
+) -> list[CropSeasonResult]:
+    """Fallow gap + crop B, continuing from the soil water left by crop A (no reset)."""
+    results = []
+    for first in first_seasons:
+        simulation_start = first.harvest_date + timedelta(days=1)
+        planting = second_planting_date(first.harvest_date)
+        [result], _ = simulate_phases(
+            climate.between(simulation_start, harvest_date(planting, crop)),
+            simulation_start,
+            [(_water_requirements(crop), planting)],
+            soil,
+            first.carry_over,
+        )
+        results.append(result)
+    return results
+
+
+def _rotation_crop(
+    crop: CropDetail,
+    risk: CropRisk,
+    planting_date: date,
+    calendar: CropCalendar | None,
+    agricultural_year: int,
+) -> RotationCrop:
     return RotationCrop(
         crop=CropWithRisk(**crop.model_dump(), risk=risk),
-        planting_date=planting,
-        harvest_date=harvest_date(planting, crop),
+        planting_date=planting_date,
+        harvest_date=harvest_date(planting_date, crop),
+        calendar=calendar_info(crop, calendar, agricultural_year),
     )
 
 
-def rank_key(a: CropRisk, b: CropRisk, planting: date, codes: tuple[int, int]) -> tuple:
-    """Lowest worst individual risk first; unknown risk sorts last. No combined risk is exposed."""
-    risks = [r.risk_percentage for r in (a, b)]
-    losses = [r.estimated_yield_loss_pct for r in (a, b)]
-    if None in risks or None in losses:
-        return (1, 0.0, 0.0, 0.0, planting, codes)
-    return (0, max(risks), max(losses), sum(losses), planting, codes)
+def evaluate_rotation(
+    crop_a: CropDetail,
+    crop_b: CropDetail,
+    first_planting: date,
+    climate_days: Sequence[DiaClima],
+    season_years: Sequence[int],
+    soil: SoilProfile | SoilType,
+    initial_water_fraction: float = INITIAL_SOIL_WATER_FRACTION,
+    calendars: Mapping[int, CropCalendar] | None = None,
+    agricultural_year: int | None = None,
+) -> RankedRotation:
+    """Risk of one sequence on one planting date, with no family, temperature, season or
+    calendar-date filter (calendars only set the cycle lengths)."""
+    calendars = calendars or {}
+    calendar_a = calendars.get(crop_a.eco_port_code)
+    calendar_b = calendars.get(crop_b.eco_port_code)
+    crop_a, crop_b = apply_calendar(crop_a, calendar_a), apply_calendar(crop_b, calendar_b)
+    climate = _Climate(climate_days)
+    if agricultural_year is None:
+        agricultural_year = season_of(first_planting)
+    first_seasons = _simulate_first_crop(
+        crop_a,
+        first_planting,
+        climate,
+        agricultural_year,
+        season_years,
+        soil,
+        initial_water_fraction,
+    )
+    risk_a = crop_risk([season.result for season in first_seasons])
+    risk_b = crop_risk(_simulate_second_crop(crop_b, first_seasons, climate, soil))
+    planting_b = second_planting_date(harvest_date(first_planting, crop_a))
+    return RankedRotation(
+        ranking_key=rank_key(
+            risk_a, risk_b, first_planting, (crop_a.eco_port_code, crop_b.eco_port_code)
+        ),
+        first=_rotation_crop(crop_a, risk_a, first_planting, calendar_a, agricultural_year),
+        second=_rotation_crop(crop_b, risk_b, planting_b, calendar_b, agricultural_year),
+    )
 
 
-def mock_recommendations(
-    repo: CropRepository, request: RotationRequest, today: date
-) -> RotationRecommendationsResponse:
-    year = request.agricultural_year or next_agricultural_year(today)
-    season_end = date(year + 1, 8, 31)
-    candidates = []
-    for code_a, code_b in MOCK_SEQUENCES:
-        crop_a, crop_b = repo.get(code_a), repo.get(code_b)
-        if crop_a is None or crop_b is None or crop_a.family == crop_b.family:
-            continue
-        risk_a, risk_b = _mock_risk(code_a), _mock_risk(code_b)
-        a = _rotation_crop(crop_a, risk_a, date(year, *MOCK_PLANTING_A))
-        b = _rotation_crop(crop_b, risk_b, a.harvest_date + timedelta(days=PLANTING_GAP_DAYS + 1))
-        if b.harvest_date > season_end:
-            continue
-        key = rank_key(risk_a, risk_b, a.planting_date, (code_a, code_b))
-        candidates.append((key, a, b))
+def rank_rotations(
+    crops: Sequence[CropDetail],
+    climate_days: Sequence[DiaClima],
+    season_years: Sequence[int],
+    soil: SoilProfile | SoilType,
+    agricultural_year: int,
+    initial_water_fraction: float = INITIAL_SOIL_WATER_FRACTION,
+    calendars: Mapping[int, CropCalendar] | None = None,
+) -> list[RankedRotation]:
+    """Best planting date of every viable ordered pair (A → B), sorted from lowest risk.
 
-    candidates.sort(key=lambda item: item[0])
-    rotations = [
-        Rotation(
-            id=f"{a.crop.eco_port_code}-{b.crop.eco_port_code}-{a.planting_date:%Y-%m-%d}",
-            rank=rank,
-            crops=[a, b],
-        )
-        for rank, (_, a, b) in enumerate(candidates[:MAX_ROTATIONS], start=1)
+    Dates are in `agricultural_year`; each one is simulated on the same day and month of every
+    historical season in `season_years` (start years of Sep–Aug seasons). `calendars` (by
+    EcoCrop code) set the cycle length and planting dates of each crop; crops without one use
+    the FAO-56 cycle and PLANTING_WINDOW_A.
+    """
+    calendars = calendars or {}
+    climate = _Climate(climate_days)
+    season_end = date(agricultural_year + 1, *SEASON_END)
+    candidates = [
+        apply_calendar(crop, calendars.get(crop.eco_port_code))
+        for crop in crops
+        if crop.family
+        and crop.water_requirements is not None
+        and crop.water_requirements.yield_response_factor.season is not None
     ]
+    suitable: dict[tuple[int, date], bool] = {}
+
+    def is_suitable(crop: CropDetail, planting_date: date) -> bool:
+        key = (crop.eco_port_code, planting_date)
+        if key not in suitable:
+            suitable[key] = _temperature_suitable(
+                crop, planting_date, climate, agricultural_year, season_years
+            )
+        return suitable[key]
+
+    best_by_pair: dict[tuple[int, int], RankedRotation] = {}
+    for crop_a in candidates:
+        calendar_a = calendars.get(crop_a.eco_port_code)
+        for first_planting in first_planting_dates(agricultural_year, calendar_a):
+            if not is_suitable(crop_a, first_planting):
+                continue
+            planting_b = second_planting_date(harvest_date(first_planting, crop_a))
+            first_seasons: list[_FirstCropSeason] | None = None
+            risk_a: CropRisk | None = None
+            for crop_b in candidates:
+                crop_codes = (crop_a.eco_port_code, crop_b.eco_port_code)
+                calendar_b = calendars.get(crop_b.eco_port_code)
+                if crop_a.family == crop_b.family or harvest_date(planting_b, crop_b) > season_end:
+                    continue
+                if not fits_calendar(planting_b, calendar_b):
+                    continue
+                if not is_suitable(crop_b, planting_b):
+                    continue
+                if first_seasons is None or risk_a is None:
+                    first_seasons = _simulate_first_crop(
+                        crop_a,
+                        first_planting,
+                        climate,
+                        agricultural_year,
+                        season_years,
+                        soil,
+                        initial_water_fraction,
+                    )
+                    risk_a = crop_risk([season.result for season in first_seasons])
+                risk_b = crop_risk(_simulate_second_crop(crop_b, first_seasons, climate, soil))
+                ranked = RankedRotation(
+                    ranking_key=rank_key(risk_a, risk_b, first_planting, crop_codes),
+                    first=_rotation_crop(
+                        crop_a, risk_a, first_planting, calendar_a, agricultural_year
+                    ),
+                    second=_rotation_crop(
+                        crop_b, risk_b, planting_b, calendar_b, agricultural_year
+                    ),
+                )
+                best = best_by_pair.get(crop_codes)
+                if best is None or ranked.ranking_key < best.ranking_key:
+                    best_by_pair[crop_codes] = ranked
+    return sorted(best_by_pair.values(), key=lambda ranked: ranked.ranking_key)
+
+
+def _rotation(
+    rank: int,
+    ranked: RankedRotation,
+    agricultural_year: int,
+    history_families: Sequence[str] = (),
+) -> Rotation:
+    first_code, second_code = ranked.crop_codes
+    planned = [
+        (rotation_crop.planting_date, rotation_crop.harvest_date, rotation_crop.crop.family or "")
+        for rotation_crop in (ranked.first, ranked.second)
+    ]
+    return Rotation(
+        id=f"{first_code}-{second_code}-{ranked.first.planting_date:%Y-%m-%d}",
+        rank=rank,
+        crops=[ranked.first, ranked.second],
+        soil_protection=soil_protection(
+            planned,
+            history_families,
+            date(agricultural_year, *SEASON_START),
+            date(agricultural_year + 1, *SEASON_END),
+        ),
+    )
+
+
+def history_families(repository: CropRepository, crop_history: Sequence[int]) -> list[str]:
+    """EcoCrop families of the previous crops; ValueError for unknown codes or no family."""
+    families = []
+    for code in crop_history:
+        crop = repository.get(code)
+        if crop is None or not crop.family:
+            raise ValueError(f"crop_history: unknown crop or crop without family: {code}")
+        families.append(crop.family)
+    return families
+
+
+def top_sequences(ranked: Sequence[RankedRotation]) -> list[tuple[tuple[int, int], date]]:
+    """Crop pairs and planting dates of the recommended rotations, to compare rankings."""
+    return [
+        (rotation.crop_codes, rotation.first.planting_date) for rotation in ranked[:MAX_ROTATIONS]
+    ]
+
+
+class _RankingCache:
+    """Small thread-safe LRU of rankings (requests run in a thread pool)."""
+
+    def __init__(self, max_size: int) -> None:
+        self._items: OrderedDict[Hashable, list[RankedRotation]] = OrderedDict()
+        self._max_size = max_size
+        self._lock = threading.Lock()
+
+    def get(self, key: Hashable | None) -> list[RankedRotation] | None:
+        if key is None:
+            return None
+        with self._lock:
+            ranked = self._items.get(key)
+            if ranked is not None:
+                self._items.move_to_end(key)
+            return ranked
+
+    def put(self, key: Hashable | None, ranked: list[RankedRotation]) -> None:
+        if key is None:
+            return
+        with self._lock:
+            self._items[key] = ranked
+            self._items.move_to_end(key)
+            while len(self._items) > self._max_size:
+                self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+_ranking_cache = _RankingCache(RANKING_CACHE_SIZE)
+
+
+def soil_info_from_texture_class(soil_type: SoilType) -> SoilInfo:
+    profile = SoilProfile.from_texture_class(soil_type)
+    return SoilInfo(
+        source="REQUEST_TEXTURE_CLASS",
+        texture_class=profile.texture_class,
+        available_water_mm_per_m=profile.available_water_mm_per_m,
+    )
+
+
+def soil_info_from_estimate(estimate: SoilEstimate) -> SoilInfo:
+    texture = estimate.root_zone_texture
+    limits = saxton_rawls_2006(texture)
+    profile = estimate.profile
+    return SoilInfo(
+        source="SOILGRIDS_SAXTON_RAWLS_2006",
+        texture_class=profile.texture_class,
+        available_water_mm_per_m=round(profile.available_water_mm_per_m, 1),
+        sand_pct=round(texture.sand_pct, 1),
+        silt_pct=round(texture.silt_pct, 1),
+        clay_pct=round(texture.clay_pct, 1),
+        organic_matter_pct=round(texture.organic_matter_pct, 2),
+        field_capacity=round(limits.field_capacity, 3),
+        wilting_point=round(limits.wilting_point, 3),
+        sampled_location=LocationSchema(lat=estimate.sampled_lat, lon=estimate.sampled_lon),
+        distance_km=estimate.distance_km,
+    )
+
+
+def soil_properties_from_estimate(estimate: SoilEstimate) -> SoilProperties:
+    texture = estimate.topsoil_texture
+    return SoilProperties(
+        organic_carbon_g_per_kg=round(
+            10 * texture.organic_matter_pct / ORGANIC_MATTER_PER_CARBON, 1
+        ),
+        sand_pct=round(texture.sand_pct, 1),
+        silt_pct=round(texture.silt_pct, 1),
+        clay_pct=round(texture.clay_pct, 1),
+        texture_class=texture_class(texture),
+        sampled_location=LocationSchema(lat=estimate.sampled_lat, lon=estimate.sampled_lon),
+        distance_km=estimate.distance_km,
+    )
+
+
+def recommendations(
+    repository: CropRepository,
+    request: RotationRequest,
+    climate_days: Sequence[DiaClima],
+    season_years: Sequence[int],
+    today: date,
+    climate_key: Hashable | None = None,
+    soil: SoilInfo | None = None,
+    soil_properties: SoilProperties | None = None,
+    soil_properties_error: str | None = None,
+) -> RotationRecommendationsResponse:
+    """Top rotations for the request, with assumptions and warnings.
+
+    `climate_key` identifies the climate series (e.g. the POWER cell). When given, the ranking is
+    cached: it depends only on the climate, soil, crop calendars, agricultural year and seasons
+    (a few seconds to compute on 30 seasons).
+    """
+    year = request.agricultural_year or next_agricultural_year(today)
+    previous_families = history_families(repository, request.crop_history)
+    if soil is None:
+        if request.soil_type is None:
+            raise ValueError("soil is required when the request has no soil_type")
+        soil = soil_info_from_texture_class(request.soil_type)
+    profile = SoilProfile(soil.texture_class, soil.available_water_mm_per_m)
+    crops = [crop for code in ROTATION_CROP_CODES if (crop := repository.get(code)) is not None]
+    calendars = crop_calendars(request.location.lat, request.location.lon)
+    cache_key = (
+        None
+        if climate_key is None
+        else (climate_key, profile, tuple(sorted(calendars.items())), year, tuple(season_years))
+    )
+    ranked = _ranking_cache.get(cache_key)
+    if ranked is None:
+        ranked = rank_rotations(
+            crops, climate_days, season_years, profile, year, calendars=calendars
+        )
+        _ranking_cache.put(cache_key, ranked)
+    without_calendar = [
+        crop.water_requirements.profile_name
+        for crop in crops
+        if crop.eco_port_code not in calendars and crop.water_requirements is not None
+    ]
+
+    warnings = [
+        EXPERIMENTAL_WARNING,
+        INITIAL_WATER_WARNING,
+        GRID_WARNING,
+        CALENDAR_WARNING,
+        TEMPERATURE_FILTER_WARNING,
+        SENSITIVITY_WARNING,
+        SOILGRIDS_WARNING if soil.source == "SOILGRIDS_SAXTON_RAWLS_2006" else SOIL_CLASS_WARNING,
+        SOIL_PROTECTION_WARNING,
+    ]
+    if not request.crop_history:
+        warnings.append(NO_HISTORY_WARNING)
+    if soil_properties is not None:
+        warnings.append(SOIL_PROPERTIES_WARNING)
+    elif soil_properties_error:
+        warnings.append(SOIL_PROPERTIES_UNAVAILABLE_WARNING.format(reason=soil_properties_error))
+    if without_calendar:
+        warnings.append(CYCLE_WARNING.format(crops=", ".join(without_calendar)))
+    if len(season_years) < MIN_SEASONS_FOR_STABLE_RISK:
+        warnings.append(
+            f"Risk is based on only {len(season_years)} historical seasons; each season moves "
+            f"risk_percentage by about {100 / max(1, len(season_years)):.0f} points."
+        )
+    if not ranked:
+        warnings.append("No viable rotation was found for this location and season.")
+
     return RotationRecommendationsResponse(
         agricultural_year=year,
-        soil_type=request.soil_type,
-        rotations=rotations,
+        soil_type=soil.texture_class,
+        soil=soil,
+        soil_properties=soil_properties,
+        rotations=[
+            _rotation(rank, rotation, year, previous_families)
+            for rank, rotation in enumerate(ranked[:MAX_ROTATIONS], start=1)
+        ],
         assumptions=RotationAssumptions(
             loss_threshold_pct=LOSS_THRESHOLD_PCT,
             initial_soil_water_fraction=INITIAL_SOIL_WATER_FRACTION,
             spinup_days=SPINUP_DAYS,
             planting_gap_days=PLANTING_GAP_DAYS,
+            planting_tolerance_days=PLANTING_TOLERANCE_DAYS,
         ),
-        warnings=[MOCK_WARNING, CYCLE_WARNING],
+        warnings=warnings,
     )
