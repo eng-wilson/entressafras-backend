@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -146,3 +148,39 @@ class CropPage(BaseModel):
     limit: int
     offset: int
     items: list[CropSummary]
+
+
+class SourcedValue(BaseModel):
+    """One published statistic and exactly where it came from."""
+
+    value: float
+    unit: Literal["USD/t", "kg/ha"]
+    period: str = Field(description="Year range of the mean (e.g. '2022-2024') or month 'YYYY-MM'")
+    area: str = Field(description="Country or region of the statistic (e.g. 'Brazil')")
+    method: Literal["direct", "proxy"] = Field(
+        description="direct: the crop's own series; proxy: another crop or region stands in for it"
+    )
+    proxy_of: str | None = Field(
+        None, description="Series actually used when method is proxy, as 'item (area)'"
+    )
+    source: str = Field(description="Publisher and dataset")
+    series: str = Field(description="Item or column name in the source")
+    url: str = Field(description="Where to download or browse the data")
+    note: str | None = None
+
+
+class CropEconomics(BaseModel):
+    """National reference economics of a crop: farm-gate price, yield and gross revenue.
+
+    Official national averages, not a quote or a yield forecast for the requested location, and
+    gross revenue only (no production costs). The site water risk is not applied: the national
+    yield already includes typical losses.
+    """
+
+    farm_gate_price: SourcedValue = Field(description="Price received by farmers, USD/t")
+    crop_yield: SourcedValue = Field(description="Harvested yield, kg/ha")
+    gross_revenue_usd_ha: float = Field(description="crop_yield / 1000 × farm_gate_price")
+    international_price: SourcedValue | None = Field(
+        None, description="International benchmark from market quotes, USD/t; null when none"
+    )
+    estimate: Literal[True] = True

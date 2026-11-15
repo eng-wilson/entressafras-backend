@@ -92,3 +92,33 @@ sor, mil, cot, bea, sun, nut), a grade global de 0,5° do
 Licença CC BY 4.0. Cite: Jägermeyr, J. et al. (2021). Climate impacts on global agriculture
 emerge earlier in new generation of climate and crop models. Nature Food 2:873–885.
 doi:10.1038/s43016-021-00400-y.
+
+# Dados: preço, produtividade e faturamento de referência (`prices/`)
+
+`crop_economics.json` traz, para as 9 culturas da rotação, o preço recebido pelo produtor, a
+produtividade e o faturamento bruto de referência (produtividade/1000 × preço, USD/ha). Gerado por
+`uv run --with openpyxl python -m scripts.build_crop_economics` (downloads em `.cache/crop_economics/`).
+
+- **Preço ao produtor:** [FAOSTAT Producer Prices (PP)](https://www.fao.org/faostat/en/#data/PP),
+  elemento "Producer Price (USD/tonne)", valor anual, Brasil.
+- **Produtividade:** [FAOSTAT Crops and livestock products (QCL)](https://www.fao.org/faostat/en/#data/QCL),
+  elemento "Yield" (kg/ha), Brasil.
+- Ambos são a média dos 3 últimos anos com dado (hoje 2022–2024), em USD nominal.
+- **Referência internacional** (só exibição): [World Bank Pink Sheet](https://www.worldbank.org/en/research/commodity-markets),
+  último mês publicado. Soja, milho, algodão (pluma, Cotlook A, convertido de USD/kg) e amendoim
+  (descascado). Sorgo foi descontinuado pelo Banco Mundial; girassol só tem óleo; feijão, caupi e
+  milheto não têm série.
+- **Proxies** (`method: "proxy"`): o FAOSTAT não tem milheto nem caupi no Brasil. Milheto usa o preço
+  do sorgo (Brasil) e a produtividade de milheto da América do Sul; caupi usa preço e produtividade de
+  "Beans, dry" (Brasil), que na estatística brasileira de feijão inclui o caupi.
+- É uma média nacional, não previsão para a fazenda: não aplica o risco hídrico do local (a média já
+  embute perdas típicas) e não desconta custos de produção.
+- **Prioridade `revenue`** (opcional, desligada por padrão): ordena pela soma do faturamento de cada
+  cultura × (1 − perda hídrica estimada no local). A nota 0–100 usa como teto as duas culturas de
+  maior faturamento do arquivo sem perda (hoje algodão + amendoim, ~US$ 5.876/ha); ao regenerar o
+  arquivo, o teto acompanha. Não entra em `overall`.
+- O link do Pink Sheet muda a cada ano (id do documento); pegue o atual em worldbank.org/commodities
+  e passe em `--pinksheet-url`.
+
+Licença CC BY 4.0 (FAOSTAT e World Bank). Cite: FAO. FAOSTAT: Producer Prices; Crops and livestock
+products. Rome. https://www.fao.org/faostat/ — e World Bank. Commodity Price Data (The Pink Sheet).

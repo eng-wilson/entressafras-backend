@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas.crop import CropDetail
+from app.schemas.crop import CropDetail, CropEconomics
 from app.services.soil import SoilType
 
 RiskMethod = Literal["FAO56_SIMPLIFIED_KY"]
@@ -26,7 +26,9 @@ class Location(BaseModel):
 
 
 class Priorities(BaseModel):
-    """Ranking priorities: 1 turns an indicator on, 0 turns it off (all on by default).
+    """Ranking priorities: 1 turns an indicator on, 0 turns it off.
+
+    The three agronomic priorities are on by default; revenue is off.
 
     With every priority off, rotations are ranked by the worse individual water risk.
     """
@@ -39,6 +41,16 @@ class Priorities(BaseModel):
     )
     soil_protection: int = Field(
         1, ge=0, le=1, description="Rank by planned soil cover and crop family diversity"
+    )
+
+    revenue: int = Field(
+        0,
+        ge=0,
+        le=1,
+        description=(
+            "Rank by water-adjusted reference gross revenue (FAOSTAT price × yield × "
+            "(1 − site water-deficit loss)); off by default"
+        ),
     )
 
     def enabled(self) -> list[str]:
@@ -104,7 +116,10 @@ class RotationContext(BaseModel):
     )
     priorities: Priorities = Field(
         default_factory=Priorities,
-        description="Indicators that rank the rotations (0 = off, 1 = on); all on by default",
+        description=(
+            "Indicators that rank the rotations (0 = off, 1 = on); the three agronomic ones are "
+            "on by default, revenue is off"
+        ),
     )
 
 
@@ -193,6 +208,13 @@ class RotationCrop(BaseModel):
     planting_date: date
     harvest_date: date
     calendar: CropCalendarInfo
+    economics: CropEconomics | None = Field(
+        None,
+        description=(
+            "National reference farm-gate price, yield and gross revenue per hectare (FAOSTAT); "
+            "an estimate, not a forecast for this location. Null when there is no data"
+        ),
+    )
 
 
 class SoilProtectionWeights(BaseModel):
@@ -252,8 +274,19 @@ class RotationScores(BaseModel):
             "change, 100 = living crop every day and every transition changes family"
         )
     )
+    revenue: float | None = Field(
+        description=(
+            "Σ crop reference gross revenue × (1 − estimated_yield_loss_pct/100), over the "
+            "catalog's best pair at no loss (the two highest crop revenues) × 100: 0 = no revenue, "
+            "100 = that pair with no water-limited loss. Null when a crop has no economics or "
+            "an unknown risk"
+        )
+    )
     overall: float | None = Field(
-        description="Mean of the three scales; independent of the priorities"
+        description=(
+            "Mean of productivity, water_security and soil_protection (revenue is not included); "
+            "independent of the priorities"
+        )
     )
     aggregation: ScoreAggregation = "WORST_CROP"
 
@@ -264,6 +297,20 @@ class Rotation(BaseModel):
     crops: list[RotationCrop] = Field(min_length=2, max_length=2, description="In planting order")
     soil_protection: SoilProtection
     scores: RotationScores
+    gross_revenue_usd_ha: float | None = Field(
+        None,
+        description=(
+            "Sum of the crops' reference gross revenue (USD/ha) in the agricultural year; no "
+            "production costs. Null when a crop has no economics"
+        ),
+    )
+    water_adjusted_revenue_usd_ha: float | None = Field(
+        None,
+        description=(
+            "gross_revenue_usd_ha with each crop discounted by its estimated_yield_loss_pct; the "
+            "value behind scores.revenue. Null when a crop has no economics or an unknown risk"
+        ),
+    )
 
 
 class CustomRotation(BaseModel):
@@ -288,6 +335,20 @@ class CustomRotation(BaseModel):
     )
     soil_protection: SoilProtection
     scores: RotationScores
+    gross_revenue_usd_ha: float | None = Field(
+        None,
+        description=(
+            "Sum of the crops' reference gross revenue (USD/ha) in the agricultural year; no "
+            "production costs. Null when a crop has no economics"
+        ),
+    )
+    water_adjusted_revenue_usd_ha: float | None = Field(
+        None,
+        description=(
+            "gross_revenue_usd_ha with each crop discounted by its estimated_yield_loss_pct; the "
+            "value behind scores.revenue. Null when a crop has no economics or an unknown risk"
+        ),
+    )
     checks: list[str] = Field(
         description="Agronomic issues found (empty = passes the recommendation filters)"
     )

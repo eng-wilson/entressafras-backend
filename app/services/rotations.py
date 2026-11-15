@@ -56,6 +56,12 @@ from app.services.crop_calendar import (
     crop_calendars,
     scale_stage_lengths,
 )
+from app.services.crop_economics import (
+    crop_economics,
+    revenue_scale_max,
+    rotation_gross_revenue,
+    water_adjusted_revenue,
+)
 from app.services.ecocrop import CropRepository, is_simulable
 from app.services.soil import SoilProfile, SoilType, saxton_rawls_2006, texture_class
 from app.services.soil_protection import botanical_family, exact_value, soil_protection
@@ -88,6 +94,8 @@ PLANTING_TOLERANCE_DAYS = 30
 # (current behavior) or the date offset.
 PLANTING_GAP_DAYS = 5
 MAX_ROTATIONS = 4
+# Scores averaged into RotationScores.overall (revenue is a separate, opt-in scale).
+AGRONOMIC_SCORES = ("productivity", "water_security", "soil_protection")
 MIN_SEASONS_FOR_STABLE_RISK = 15
 # Historical seasons simulated per request. ZARC uses 30 years (Portaria SPA/MAPA nº 326/2026,
 # item 1.11), and so does the WMO climate normal.
@@ -98,7 +106,8 @@ SOYBEAN, MAIZE, SORGHUM, MILLET, COTTON = 1150, 2175, 48747, 8418, 1160
 COMMON_BEAN, COWPEA, SUNFLOWER, GROUNDNUT = 1668, 2153, 1191, 2199
 # Candidate crops for the second-season rotation (EcoCrop codes with FAO-56 CROPWAT profiles).
 # TODO(pending): the only agronomic rule is "different botanical family"; pests, diseases,
-# nematodes, straw, nutrients, yield and economics are not considered (follow-up 10).
+# nematodes, straw, nutrients and yield are not considered (follow-up 10). Reference economics
+# (FAOSTAT price × yield) only rank through the opt-in revenue priority.
 ROTATION_CROP_CODES: tuple[int, ...] = (
     SOYBEAN,
     MAIZE,
@@ -159,6 +168,12 @@ PRIORITIES_WARNING = (
     "0–100 scales (0 = worst possible, 100 = best possible) and do not depend on the priorities: "
     "productivity is the mean preserved yield and water_security the share of seasons without a "
     "critical loss, both for the worse of the two crops."
+)
+REVENUE_WARNING = (
+    "The revenue priority uses the national FAOSTAT reference (farm-gate price × yield, Brazil, "
+    "latest 3-year mean) discounted by each crop's estimated water-deficit loss at this site. It "
+    "is an estimate, not a forecast, and has no production costs. The national yield already "
+    "includes typical losses, and with productivity also on, the water loss weighs twice."
 )
 NO_PRIORITIES_WARNING = (
     "Every priority is off: rotations are ranked by the worse individual water risk."
@@ -510,6 +525,17 @@ def _rotation_crop(
         planting_date=planting_date,
         harvest_date=harvest_date(planting_date, crop),
         calendar=calendar_info(crop, calendar, agricultural_year),
+        economics=crop_economics(crop.eco_port_code),
+    )
+
+
+def _gross_revenue(crops: Sequence[RotationCrop]) -> float | None:
+    return rotation_gross_revenue(crop.economics for crop in crops)
+
+
+def _water_adjusted_revenue(crops: Sequence[RotationCrop]) -> float | None:
+    return water_adjusted_revenue(
+        (crop.economics, crop.crop.risk.estimated_yield_loss_pct) for crop in crops
     )
 
 
@@ -714,7 +740,13 @@ def rotation_indicators(
             [None if risk.risk_percentage is None else 100 - risk.risk_percentage for risk in risks]
         ),
         "soil_protection": exact_value(protection),
+        "revenue": _revenue_score(ranked.crops),
     }
+
+
+def _revenue_score(crops: Sequence[RotationCrop]) -> float | None:
+    revenue = _water_adjusted_revenue(crops)
+    return None if revenue is None else min(100.0, revenue / revenue_scale_max() * 100)
 
 
 def rotation_scores(indicators: Mapping[str, float | None]) -> RotationScores:
@@ -723,7 +755,8 @@ def rotation_scores(indicators: Mapping[str, float | None]) -> RotationScores:
         productivity=_round(indicators["productivity"], 1),
         water_security=_round(indicators["water_security"], 1),
         soil_protection=round(indicators["soil_protection"] or 0.0, 1),
-        overall=_round(_mean_or_none(list(indicators.values())), 1),
+        revenue=_round(indicators["revenue"], 1),
+        overall=_round(_mean_or_none([indicators[name] for name in AGRONOMIC_SCORES]), 1),
     )
 
 
@@ -788,6 +821,8 @@ def _rotation(rank: int, scored: ScoredRotation) -> Rotation:
         crops=list(ranked.crops),
         soil_protection=scored.soil_protection,
         scores=scored.scores,
+        gross_revenue_usd_ha=_gross_revenue(ranked.crops),
+        water_adjusted_revenue_usd_ha=_round(_water_adjusted_revenue(ranked.crops), 1),
     )
 
 
@@ -982,6 +1017,8 @@ def _warnings(
         warnings.append(NO_PRIORITIES_WARNING)
     if priorities.soil_protection:
         warnings.append(LONG_CYCLE_WARNING)
+    if priorities.revenue:
+        warnings.append(REVENUE_WARNING)
     if not request.crop_history:
         warnings.append(NO_HISTORY_WARNING)
     if soil_properties is not None:
@@ -1300,6 +1337,8 @@ def custom_rotation(
         crops=list(scored.ranked.crops),
         soil_protection=scored.soil_protection,
         scores=scored.scores,
+        gross_revenue_usd_ha=_gross_revenue(scored.ranked.crops),
+        water_adjusted_revenue_usd_ha=_round(_water_adjusted_revenue(scored.ranked.crops), 1),
         checks=custom_checks(context, plan),
     )
 

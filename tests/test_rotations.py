@@ -23,6 +23,7 @@ from app.services import power_client as pc
 from app.services import rotations as rotations_service
 from app.services.agro import DiaClima
 from app.services.crop_calendar import apply_calendar, crop_calendars, scale_stage_lengths
+from app.services.crop_economics import revenue_scale_max
 from app.services.ecocrop import get_repository
 from app.services.rotations import (
     COMMON_BEAN,
@@ -65,7 +66,14 @@ TODAY = date(2026, 11, 14)  # the rotation seed covers 1996/97–2025/26 (30 sea
 SORRISO = {"lat": -12.55, "lon": -55.72}
 BODY = {"soil_type": "medium", "location": SORRISO}
 OFF = {"productivity": 0, "water_security": 0, "soil_protection": 0}
-SCORE_KEYS = {"productivity", "water_security", "soil_protection", "overall", "aggregation"}
+SCORE_KEYS = {
+    "productivity",
+    "water_security",
+    "soil_protection",
+    "revenue",
+    "overall",
+    "aggregation",
+}
 RISK_KEYS = {
     "risk_percentage",
     "estimated_yield_loss_pct",
@@ -217,7 +225,15 @@ def test_rotation_crops_belong_to_different_families(body: dict) -> None:
 
 def test_no_combined_risk_anywhere(body: dict) -> None:
     for rotation in body["rotations"]:
-        assert set(rotation) == {"id", "rank", "crops", "soil_protection", "scores"}
+        assert set(rotation) == {
+            "id",
+            "rank",
+            "crops",
+            "soil_protection",
+            "scores",
+            "gross_revenue_usd_ha",
+            "water_adjusted_revenue_usd_ha",
+        }
         assert not any("risk" in key for key in rotation["soil_protection"])
         assert not any("risk" in key for key in rotation["scores"])
     assert not any("risk" in key for key in body)
@@ -326,7 +342,12 @@ def test_with_every_priority_off_rotations_are_sorted_by_worst_individual_risk(
 
 
 def test_priorities_default_to_all_on_and_scores_use_absolute_scales(body: dict) -> None:
-    assert body["priorities"] == {"productivity": 1, "water_security": 1, "soil_protection": 1}
+    assert body["priorities"] == {
+        "productivity": 1,
+        "water_security": 1,
+        "soil_protection": 1,
+        "revenue": 0,
+    }
     overall = []
     for rotation in body["rotations"]:
         scores = rotation["scores"]
@@ -1263,3 +1284,85 @@ def test_sweep_points_match_the_exact_simulation(client: TestClient) -> None:
             assert [crop["risk_percentage"] for crop in point["crops"]] == [
                 crop["crop"]["risk"]["risk_percentage"] for crop in exact
             ]
+
+
+def _assert_economics(rotation: dict) -> None:
+    revenues = []
+    for rotation_crop in rotation["crops"]:
+        economics = rotation_crop["economics"]
+        assert economics["estimate"] is True
+        assert economics["farm_gate_price"]["unit"] == "USD/t"
+        assert economics["crop_yield"]["unit"] == "kg/ha"
+        revenues.append(economics["gross_revenue_usd_ha"])
+    assert rotation["gross_revenue_usd_ha"] == pytest.approx(sum(revenues), abs=0.1)
+
+
+def test_recommended_rotations_carry_reference_economics(body: dict) -> None:
+    assert body["rotations"]
+    for rotation in body["rotations"]:
+        _assert_economics(rotation)
+
+
+def test_simulated_rotation_carries_reference_economics(client: TestClient) -> None:
+    simulated = _simulate(client, _soybean_then(SORGHUM), sweep=False)
+    _assert_economics(simulated["rotation"])
+
+
+# --- Revenue priority -------------------------------------------------------------------------
+
+
+def _expected_revenue(rotation: dict) -> float:
+    return sum(
+        rc["economics"]["gross_revenue_usd_ha"]
+        * (1 - rc["crop"]["risk"]["estimated_yield_loss_pct"] / 100)
+        for rc in rotation["crops"]
+    )
+
+
+def test_revenue_score_is_water_adjusted_revenue_over_the_catalog_ceiling(body: dict) -> None:
+    for rotation in body["rotations"]:
+        adjusted = rotation["water_adjusted_revenue_usd_ha"]
+        assert adjusted == pytest.approx(_expected_revenue(rotation), abs=0.1)
+        assert adjusted <= rotation["gross_revenue_usd_ha"]
+        assert rotation["scores"]["revenue"] == pytest.approx(
+            adjusted / revenue_scale_max() * 100, abs=0.05
+        )
+    assert not any("revenue priority" in warning for warning in body["warnings"])
+
+
+def test_revenue_priority_ranks_by_revenue_and_warns(client: TestClient) -> None:
+    result = _post(client, {**OFF, "revenue": 1})
+    revenue = [rotation["scores"]["revenue"] for rotation in result["rotations"]]
+    assert revenue == sorted(revenue, reverse=True)
+    assert result["priorities"]["revenue"] == 1
+    assert any("revenue priority" in warning for warning in result["warnings"])
+
+
+def test_revenue_indicator_discounts_each_crop_by_its_water_loss(soy_maize) -> None:
+    indicators = _indicators(soy_maize, _risk(10.0, 0.0, 0.95), _risk(20.0, 10.0, 0.97))
+    soy, maize = (rc.economics.gross_revenue_usd_ha for rc in soy_maize.crops)
+    expected = (soy * 0.9 + maize * 0.8) / revenue_scale_max() * 100
+    assert indicators["revenue"] == pytest.approx(expected)
+    only_revenue = Priorities(**OFF, revenue=1)
+    assert priority_value(indicators, only_revenue) == pytest.approx(expected)
+    scores = rotation_scores(indicators)
+    assert scores.revenue == pytest.approx(expected, abs=0.05)
+    mean = (scores.productivity + scores.water_security + indicators["soil_protection"]) / 3
+    assert scores.overall == pytest.approx(mean, abs=0.05)  # revenue stays out of overall
+
+
+def test_unknown_loss_gives_no_revenue_score(soy_maize) -> None:
+    indicators = _indicators(soy_maize, _risk(None, None, None), _risk(1.0, 0.0, 0.99))
+    assert indicators["revenue"] is None
+    assert rotation_scores(indicators).revenue is None
+
+
+def test_planting_sweep_best_follows_the_revenue_priority(client: TestClient) -> None:
+    simulated = _simulate(
+        client, {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]}, priorities={**OFF, "revenue": 1}
+    )
+    sweep = simulated["first_planting_sweep"]
+    points = {p["decendio_idx"]: p for p in sweep["points"]}
+    revenue = [p["scores"]["revenue"] for p in points.values()]
+    assert None not in revenue
+    assert points[sweep["best_decendio_idx"]]["scores"]["revenue"] == max(revenue)

@@ -1,0 +1,308 @@
+{
+  "generated": "2026-11-15",
+  "country": "Brazil",
+  "years_averaged": 3,
+  "sources": {
+    "faostat_prices": "https://bulks-faostat.fao.org/production/Prices_E_All_Data_(Normalized).zip",
+    "faostat_production": "https://bulks-faostat.fao.org/production/Production_Crops_Livestock_E_All_Data_(Normalized).zip",
+    "pinksheet": "https://thedocs.worldbank.org/en/doc/74e8be41ceb20fa0da750cda2f6b9e4e-0050012026/related/CMO-Historical-Data-Monthly.xlsx"
+  },
+  "crops": {
+    "1150": {
+      "farm_gate_price": {
+        "value": 449.2,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Soya beans",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 3175.7,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Soya beans",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 1426.5,
+      "international_price": {
+        "value": 515.0,
+        "unit": "USD/t",
+        "period": "2026-10",
+        "area": "World market",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "World Bank Commodity Price Data (Pink Sheet)",
+        "series": "Soybeans",
+        "url": "https://www.worldbank.org/en/research/commodity-markets",
+        "note": null
+      }
+    },
+    "2175": {
+      "farm_gate_price": {
+        "value": 180.2,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Maize (corn)",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 5516.0,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Maize (corn)",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 994.0,
+      "international_price": {
+        "value": 226.5,
+        "unit": "USD/t",
+        "period": "2026-10",
+        "area": "World market",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "World Bank Commodity Price Data (Pink Sheet)",
+        "series": "Maize",
+        "url": "https://www.worldbank.org/en/research/commodity-markets",
+        "note": null
+      }
+    },
+    "48747": {
+      "farm_gate_price": {
+        "value": 146.1,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Sorghum",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 3046.6,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Sorghum",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 445.1,
+      "international_price": null
+    },
+    "8418": {
+      "farm_gate_price": {
+        "value": 146.1,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "proxy",
+        "proxy_of": "Sorghum (Brazil)",
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Sorghum",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": "FAOSTAT has no millet series for the country; priced as sorghum"
+      },
+      "crop_yield": {
+        "value": 1379.3,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "South America",
+        "method": "proxy",
+        "proxy_of": "Millet (South America)",
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Millet",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": "FAOSTAT has no millet series for the country; regional yield"
+      },
+      "gross_revenue_usd_ha": 201.5,
+      "international_price": null
+    },
+    "1160": {
+      "farm_gate_price": {
+        "value": 827.2,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Seed cotton, unginned",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 4169.4,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Seed cotton, unginned",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 3448.9,
+      "international_price": {
+        "value": 2000.0,
+        "unit": "USD/t",
+        "period": "2026-10",
+        "area": "World market",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "World Bank Commodity Price Data (Pink Sheet)",
+        "series": "Cotton, A Index",
+        "url": "https://www.worldbank.org/en/research/commodity-markets",
+        "note": "Cotton lint (Cotlook A Index), not seed cotton; converted from USD/kg"
+      }
+    },
+    "1668": {
+      "farm_gate_price": {
+        "value": 797.2,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Beans, dry",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 1137.7,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Beans, dry",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 907.0,
+      "international_price": null
+    },
+    "2153": {
+      "farm_gate_price": {
+        "value": 797.2,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "proxy",
+        "proxy_of": "Beans, dry (Brazil)",
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Beans, dry",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": "FAOSTAT has no cowpea series for the country; Brazilian 'feijão' statistics include cowpea (Vigna) together with common bean (Phaseolus)"
+      },
+      "crop_yield": {
+        "value": 1137.7,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "proxy",
+        "proxy_of": "Beans, dry (Brazil)",
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Beans, dry",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": "FAOSTAT has no cowpea series for the country; Brazilian 'feijão' statistics include cowpea (Vigna) together with common bean (Phaseolus)"
+      },
+      "gross_revenue_usd_ha": 907.0,
+      "international_price": null
+    },
+    "1191": {
+      "farm_gate_price": {
+        "value": 405.5,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Sunflower seed",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 1587.0,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Sunflower seed",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 643.5,
+      "international_price": null
+    },
+    "2199": {
+      "farm_gate_price": {
+        "value": 698.6,
+        "unit": "USD/t",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Producer Prices (PP)",
+        "series": "Groundnuts, excluding shelled",
+        "url": "https://www.fao.org/faostat/en/#data/PP",
+        "note": null
+      },
+      "crop_yield": {
+        "value": 3474.8,
+        "unit": "kg/ha",
+        "period": "2022-2024",
+        "area": "Brazil",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "FAOSTAT Crops and livestock products (QCL)",
+        "series": "Groundnuts, excluding shelled",
+        "url": "https://www.fao.org/faostat/en/#data/QCL",
+        "note": null
+      },
+      "gross_revenue_usd_ha": 2427.5,
+      "international_price": {
+        "value": 1600.0,
+        "unit": "USD/t",
+        "period": "2026-10",
+        "area": "World market",
+        "method": "direct",
+        "proxy_of": null,
+        "source": "World Bank Commodity Price Data (Pink Sheet)",
+        "series": "Groundnuts",
+        "url": "https://www.worldbank.org/en/research/commodity-markets",
+        "note": "Shelled groundnuts; the farm-gate price is in shell"
+      }
+    }
+  }
+}
