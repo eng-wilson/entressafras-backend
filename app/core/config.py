@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     app_name: str = "Entressafras API"
     debug: bool = False
     ecocrop_csv_path: Path = APP_DIR / "data" / "EcoCrop_DB.csv"
+    cropwat_tsv_path: Path = APP_DIR / "data" / "cropwat_crop_params.tsv"
 
     cors_origins: list[str] = ["http://localhost:5173"]
 

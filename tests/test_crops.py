@@ -74,3 +74,36 @@ def test_limit_validation() -> None:
 def test_search_no_results() -> None:
     body = client.get("/api/crops", params={"q": "xyznotacrop"}).json()
     assert body == {"total": 0, "limit": 20, "offset": 0, "items": []}
+
+
+def test_get_crop_water_requirements_maize() -> None:
+    water = client.get("/api/crops/2175").json()["water_requirements"]
+    assert water["profile"] == "FAO-MAIZE"
+    assert water["profile_name"] == "MAIZE (Grain)"
+    assert water["crop_coefficient"] == {"initial": 0.3, "mid_season": 1.2, "late_season": 0.35}
+    assert water["stage_length_days"] == {
+        "initial": 20,
+        "development": 35,
+        "mid_season": 40,
+        "late_season": 30,
+        "total": 125,
+    }
+    assert water["root_depth_m"] == {"initial": 0.3, "max": 1.0}
+    assert water["allowable_depletion"]["late_season"] == 0.8
+    assert water["yield_response_factor"]["season"] == 1.25
+    assert water["max_height_m"] == 2.0
+
+
+def test_get_crop_water_requirements_soybean() -> None:
+    water = client.get("/api/crops/1150").json()["water_requirements"]
+    assert water["profile"] == "FAO-SOYBEAN"
+    assert water["crop_coefficient"]["mid_season"] == 1.15
+
+
+def test_get_crop_without_water_profile_is_null() -> None:
+    assert client.get("/api/crops/290").json()["water_requirements"] is None
+
+
+def test_search_summary_has_no_water_requirements() -> None:
+    item = client.get("/api/crops", params={"q": "milho"}).json()["items"][0]
+    assert "water_requirements" not in item

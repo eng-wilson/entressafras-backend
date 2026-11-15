@@ -43,3 +43,22 @@ Umidade do solo diária do [SMAP L4 v8](https://developers.google.com/earth-engi
 
 Domínio público. Cite: Reichle, R. et al. (2025). SMAP L4 Global 3-hourly 9 km EASE-Grid Surface
 and Root Zone Soil Moisture Geophysical Data, Version 8. NSIDC DAAC. doi:10.5067/T5RUATAQREF8.
+
+# Dados: CropWat / FAO-56 (`cropwat_crop_params.tsv`)
+
+`crop_params.tsv` do pacote R [INRAE CropWat](https://inrae.r-universe.dev/CropWat) 0.3.0
+(`inst/extdata/`), sem alterações. Salvo por `scripts/download_cropwat.py [versao]`.
+
+- 55 perfis × 21 colunas, UTF-8, separado por tab; ausente = `NA`. Só os 37 `FAO-*` são usados
+  (padrões do CropWat 8 / FAO-56); `KURN-*` (Índia) e `SB2023-*` (França, sem Ky) ficam de fora.
+- Colunas: `Kini/Kmax/Kend` (Kc), `Lini/Ldev/Lmid/Lend` (fases, dias), `Zini/Zend` (raiz, m),
+  `p_ini/p_mid/p_end` (fração de depleção), `Yini…Ytot` (Ky), `h` (altura, m), `sowing_date`.
+- São **valores de referência**, não calibrados para cultivares ou regiões brasileiras.
+- A ligação com o EcoCrop (`eco_port_code` → perfil) é curada em `app/services/cropwat.py`.
+
+## Licença e citação
+
+O pacote CropWat é distribuído sob **AGPL-3.0 ou posterior** (David Dorchies, INRAE); confira as
+condições antes de usar em produto fechado/comercial. Os valores vêm das tabelas do FAO-56. Cite:
+Allen, R. G. et al. (1998). Crop evapotranspiration: guidelines for computing crop water
+requirements. FAO Irrigation and Drainage Paper 56. Roma: FAO.

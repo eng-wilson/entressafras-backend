@@ -16,6 +16,7 @@ from app.schemas.crop import (
     TemperatureRequirements,
     TextOptions,
     TextRange,
+    WaterRequirements,
 )
 
 _MISSING = {"", "NA"}
@@ -136,9 +137,15 @@ class CropRepository:
         self._by_code = {e.crop.eco_port_code: e.crop for e in self._entries}
 
     @classmethod
-    def from_csv(cls, path: Path) -> "CropRepository":
+    def from_csv(
+        cls, path: Path, water: dict[int, WaterRequirements] | None = None
+    ) -> "CropRepository":
+        water = water or {}
         with path.open(encoding="latin-1", newline="") as f:
-            return cls([parse_row(row) for row in csv.DictReader(f)])
+            crops = [parse_row(row) for row in csv.DictReader(f)]
+        for crop in crops:
+            crop.water_requirements = water.get(crop.eco_port_code)
+        return cls(crops)
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -205,4 +212,9 @@ def _summary(crop: CropDetail) -> CropSummary:
 
 @lru_cache
 def get_repository() -> CropRepository:
-    return CropRepository.from_csv(get_settings().ecocrop_csv_path)
+    from app.services.cropwat import water_by_code  # cropwat importa helpers deste módulo
+
+    settings = get_settings()
+    return CropRepository.from_csv(
+        settings.ecocrop_csv_path, water_by_code(settings.cropwat_tsv_path)
+    )

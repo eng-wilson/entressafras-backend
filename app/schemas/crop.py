@@ -43,6 +43,58 @@ class CropCycle(BaseModel):
     max_days: int | None = Field(None, description="Ciclo máximo (GMAX), dias")
 
 
+class CropCoefficient(BaseModel):
+    """Kc da cultura: ETc = Kc × ET0. Na fase de desenvolvimento, interpola-se linearmente."""
+
+    initial: float = Field(description="Kc na fase inicial (Kini)")
+    mid_season: float = Field(description="Kc no meio do ciclo (Kmax)")
+    late_season: float = Field(description="Kc no fim do ciclo (Kend)")
+
+
+class StageLengths(BaseModel):
+    initial: int = Field(description="Fase inicial (Lini), dias")
+    development: int = Field(description="Desenvolvimento (Ldev), dias")
+    mid_season: int = Field(description="Meio do ciclo (Lmid), dias")
+    late_season: int = Field(description="Fim do ciclo (Lend), dias")
+    total: int = Field(description="Soma das fases, dias")
+
+
+class RootDepth(BaseModel):
+    initial: float = Field(description="Profundidade efetiva das raízes no plantio (Zini), m")
+    max: float = Field(description="Profundidade efetiva máxima das raízes (Zend), m")
+
+
+class AllowableDepletion(BaseModel):
+    """Fração p da água disponível no solo que pode ser consumida sem estresse hídrico."""
+
+    initial: float = Field(description="p na fase inicial (p_ini)")
+    mid_season: float = Field(description="p no meio do ciclo (p_mid)")
+    late_season: float = Field(description="p no fim do ciclo (p_end)")
+
+
+class YieldResponseFactor(BaseModel):
+    """Ky: queda relativa de produtividade por unidade de déficit relativo de evapotranspiração."""
+
+    initial: float | None = Field(None, description="Ky na fase inicial (Yini)")
+    development: float | None = Field(None, description="Ky no desenvolvimento (Ydev)")
+    mid_season: float | None = Field(None, description="Ky no meio do ciclo (Ymid)")
+    late_season: float | None = Field(None, description="Ky no fim do ciclo (Yend)")
+    season: float | None = Field(None, description="Ky do ciclo inteiro (Ytot)")
+
+
+class WaterRequirements(BaseModel):
+    """Parâmetros de referência FAO-56 (via CropWat/INRAE); não calibrados por região."""
+
+    profile: str = Field(description="Código do perfil no CropWat, ex.: 'FAO-MAIZE'")
+    profile_name: str = Field(description="Nome do perfil no CropWat")
+    crop_coefficient: CropCoefficient
+    stage_length_days: StageLengths
+    root_depth_m: RootDepth
+    allowable_depletion: AllowableDepletion
+    yield_response_factor: YieldResponseFactor
+    max_height_m: float | None = Field(None, description="Altura máxima da cultura (h), m")
+
+
 class CropSummary(BaseModel):
     eco_port_code: int
     scientific_name: str
@@ -78,6 +130,9 @@ class CropDetail(BaseModel):
     introduction_risk: str | None
     production_system: list[str]
     crop_cycle: CropCycle
+    water_requirements: WaterRequirements | None = Field(
+        None, description="Coeficientes de consumo hídrico (FAO-56); null se não houver perfil"
+    )
 
 
 class CropPage(BaseModel):

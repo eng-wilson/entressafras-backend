@@ -27,12 +27,18 @@ Dados de requisitos agroclimáticos de 2.568 culturas, lidos de `app/data/EcoCro
 - `GET /api/crops/{eco_port_code}`: detalhe da cultura (ex.: `/api/crops/2114` = trigo).
   Traz temperatura (°C), chuva (mm/ano), pH, latitude, altitude, luz, solo, fotoperíodo,
   zonas climáticas e ciclo (dias). Valores ausentes vêm como `null`.
+  Para 20 culturas de lavoura (milho, soja, feijão, sorgo, trigo, algodão etc.) inclui
+  `water_requirements`: Kc por fase (`crop_coefficient`), duração das fases
+  (`stage_length_days`), profundidade de raiz (`root_depth_m`), fração de depleção
+  (`allowable_depletion`), Ky (`yield_response_factor`) e altura (`max_height_m`), do
+  FAO-56 via CropWat. Nas demais vem `null`. Mapeamento em `app/services/cropwat.py`.
 - `GET /api/crops?q=trigo`: busca por nome científico ou popular, sem diferenciar
   maiúsculas nem acentos (ordem: exato > prefixo > contém). Filtros: `category`,
   `life_span`, `life_form`. Paginação: `limit` (1–100, padrão 20) e `offset`.
 
 Os valores de texto ficam em inglês, como na FAO. Para atualizar o CSV:
-`uv run python scripts/download_ecocrop.py`.
+`uv run python scripts/download_ecocrop.py` (e `scripts/download_cropwat.py` para os
+parâmetros hídricos).
 
 ## Clima (NASA POWER, por decêndio)
 
