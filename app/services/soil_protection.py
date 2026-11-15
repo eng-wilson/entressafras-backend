@@ -52,6 +52,19 @@ def living_cover_days(
     return len(covered)
 
 
+def protection_value(cover_fraction: float, change_fraction: float) -> float:
+    """Unrounded index (0–100), to rank without the ties of the rounded `score`."""
+    return COVER_WEIGHT * cover_fraction + DIVERSITY_WEIGHT * change_fraction
+
+
+def exact_value(protection: SoilProtection) -> float:
+    """Unrounded index of a `soil_protection` result, from its exact day and transition counts."""
+    change_fraction = (
+        protection.family_changes / protection.transitions if protection.transitions else 0.0
+    )
+    return protection_value(protection.living_cover_days / protection.season_days, change_fraction)
+
+
 def soil_protection(
     planned: Sequence[tuple[date, date, str]],
     history_families: Sequence[str],
@@ -74,7 +87,7 @@ def soil_protection(
     changes = sum(before != after for before, after in pairwise(sequence))
     change_fraction = changes / transitions if transitions else 0.0
     return SoilProtection(
-        score=round(COVER_WEIGHT * cover_fraction + DIVERSITY_WEIGHT * change_fraction),
+        score=round(protection_value(cover_fraction, change_fraction)),
         living_cover_days=cover_days,
         season_days=season_days,
         cover_fraction=round(cover_fraction, 3),

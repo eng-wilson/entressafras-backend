@@ -4,7 +4,12 @@ from datetime import date
 
 import pytest
 
-from app.services.soil_protection import botanical_family, living_cover_days, soil_protection
+from app.services.soil_protection import (
+    botanical_family,
+    exact_value,
+    living_cover_days,
+    soil_protection,
+)
 
 SOY = "Magnoliopsida:Rosidae:Fabales:Leguminosae"
 MAIZE = "Liliopsida:Commelinidae:Cyperales:Gramineae"
@@ -65,3 +70,14 @@ def test_history_with_repeated_family_lowers_diversity() -> None:
 )
 def test_score_extremes(planned, expected: int) -> None:
     assert soil_protection(planned, [], START, END).score == expected
+
+
+def test_exact_value_is_the_unrounded_score() -> None:
+    result = soil_protection(
+        [(date(2027, 10, 1), date(2028, 1, 8), SOY), (date(2028, 1, 15), date(2028, 6, 3), MAIZE)],
+        [MAIZE, MAIZE],
+        START,
+        END,
+    )
+    assert exact_value(result) == pytest.approx(70 * 241 / 366 + 30 * 2 / 3)
+    assert round(exact_value(result)) == result.score

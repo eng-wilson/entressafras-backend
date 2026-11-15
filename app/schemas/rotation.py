@@ -1,6 +1,7 @@
 """Contract of POST /rotations/recommendations.
 
 Risk is reported per crop only: there is deliberately no combined/rotation-level risk field.
+Rotation `scores` are 0–100 indicators (higher is better) used to rank by the client priorities.
 """
 
 from datetime import date
@@ -16,11 +17,32 @@ CalendarSource = Literal["GGCMI_PHASE3_V1_01", "FAO56_REFERENCE"]
 SoilSource = Literal["SOILGRIDS_SAXTON_RAWLS_2006", "REQUEST_TEXTURE_CLASS"]
 SoilProtectionMethod = Literal["PLANNED_COVER_DIVERSITY_V1"]
 Stage = Literal["initial", "development", "mid_season", "late_season"]
+ScoreAggregation = Literal["WORST_CROP"]
 
 
 class Location(BaseModel):
     lat: float = Field(ge=-90, le=90, description="Latitude, decimal degrees")
     lon: float = Field(ge=-180, le=180, description="Longitude, decimal degrees")
+
+
+class Priorities(BaseModel):
+    """Ranking priorities: 1 turns an indicator on, 0 turns it off (all on by default).
+
+    With every priority off, rotations are ranked by the worse individual water risk.
+    """
+
+    productivity: int = Field(
+        1, ge=0, le=1, description="Rank by preserved yield (100 − water-deficit loss, FAO Ky)"
+    )
+    water_security: int = Field(
+        1, ge=0, le=1, description="Rank by the share of seasons without a critical water loss"
+    )
+    soil_protection: int = Field(
+        1, ge=0, le=1, description="Rank by planned soil cover and crop family diversity"
+    )
+
+    def enabled(self) -> list[str]:
+        return [name for name, value in self.model_dump().items() if value]
 
 
 class RotationRequest(BaseModel):
@@ -47,6 +69,10 @@ class RotationRequest(BaseModel):
             "EcoCrop codes of the farmer's previous crops, oldest first (e.g. the last 2–3 "
             "seasons). Only used by the soil protection index (crop family transitions)."
         ),
+    )
+    priorities: Priorities = Field(
+        default_factory=Priorities,
+        description="Indicators that rank the rotations (0 = off, 1 = on); all on by default",
     )
 
 
@@ -75,6 +101,12 @@ class CropRisk(BaseModel):
     loss_threshold_pct: float = Field(description="Loss above which a season counts as critical")
     critical_stage: Stage | None = Field(description="Stage with the largest Ky × deficit")
     mean_isna: MeanIsna
+    mean_season_isna: float | None = Field(
+        None,
+        description=(
+            "Water satisfaction index of the whole cycle (ΣETr/ΣETc), averaged across seasons"
+        ),
+    )
     valid_years: int = Field(description="Historical seasons used")
     method: RiskMethod
     # TODO(validate): compare with the official ZARC zoning for soybean and maize in MT before
@@ -140,11 +172,44 @@ class SoilProtection(BaseModel):
     validated: Literal[False] = False
 
 
+class RotationScores(BaseModel):
+    """Absolute 0–100 scales (0 = worst possible, 100 = best possible), for charts.
+
+    Not relative to the other rotations and independent of `priorities`, which only set the
+    order. productivity and water_security take the worse of the two crops; null when its risk
+    is unknown.
+    """
+
+    productivity: float | None = Field(
+        description=(
+            "Preserved yield, 100 − estimated_yield_loss_pct: 0 = total loss from water deficit, "
+            "100 = no water-limited loss (ideal moisture)"
+        )
+    )
+    water_security: float | None = Field(
+        description=(
+            "Seasons without a critical loss, 100 − risk_percentage: 0 = every season lost more "
+            "than loss_threshold_pct, 100 = none did"
+        )
+    )
+    soil_protection: float = Field(
+        description=(
+            "Unrounded soil_protection index 70C + 30D: 0 = bare soil all season and no family "
+            "change, 100 = living crop every day and every transition changes family"
+        )
+    )
+    overall: float | None = Field(
+        description="Mean of the three scales; independent of the priorities"
+    )
+    aggregation: ScoreAggregation = "WORST_CROP"
+
+
 class Rotation(BaseModel):
     id: str
     rank: int = Field(ge=1, le=4)
     crops: list[RotationCrop] = Field(min_length=2, max_length=2, description="In planting order")
     soil_protection: SoilProtection
+    scores: RotationScores
 
 
 class RotationAssumptions(BaseModel):
@@ -201,6 +266,7 @@ class RotationRecommendationsResponse(BaseModel):
     soil_properties: SoilProperties | None = Field(
         None, description="Estimated soil properties (separate panel); null when unavailable"
     )
+    priorities: Priorities = Field(description="Priorities used in the ranking")
     rotations: list[Rotation] = Field(max_length=4)
     assumptions: RotationAssumptions
     warnings: list[str]

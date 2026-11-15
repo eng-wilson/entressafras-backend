@@ -5,7 +5,9 @@ planting date of A, both crops are simulated in every historical season (`water_
 Planting dates and cycle lengths follow the regional GGCMI crop calendar (`crop_calendar`): A is
 planted around its calendar date, and B (right after the harvest of A) only when that date is
 close to its own calendar date. Each
-crop gets its own risk (`crop_risk`); pairs are ranked by the worse of the two individual risks.
+crop gets its own risk (`crop_risk`). Pairs are ranked by the client priorities (`Priorities`):
+the mean of the enabled 0–100 indicators (productivity and water security of the worse crop, soil
+protection of the rotation); with every priority off, by the worse of the two individual risks.
 There is deliberately no combined rotation risk. Climate is the historical record used as a set of
 scenarios, not a forecast.
 """
@@ -14,9 +16,10 @@ import statistics
 import threading
 from bisect import bisect_left, bisect_right
 from collections import Counter, OrderedDict
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
+from typing import Protocol
 
 from app.schemas.crop import CropDetail, WaterRequirements
 from app.schemas.rotation import (
@@ -24,13 +27,16 @@ from app.schemas.rotation import (
     CropRisk,
     CropWithRisk,
     MeanIsna,
+    Priorities,
     Rotation,
     RotationAssumptions,
     RotationCrop,
     RotationRecommendationsResponse,
     RotationRequest,
+    RotationScores,
     SoilInfo,
     SoilProperties,
+    SoilProtection,
     Stage,
 )
 from app.schemas.rotation import Location as LocationSchema
@@ -43,7 +49,7 @@ from app.services.crop_calendar import (
 )
 from app.services.ecocrop import CropRepository
 from app.services.soil import SoilProfile, SoilType, saxton_rawls_2006, texture_class
-from app.services.soil_protection import soil_protection
+from app.services.soil_protection import exact_value, soil_protection
 from app.services.soilgrids_client import ORGANIC_MATTER_PER_CARBON, SoilEstimate
 from app.services.water_balance import STAGES, CropSeasonResult, SoilCarryOver, simulate_phases
 
@@ -137,8 +143,21 @@ SOIL_CLASS_WARNING = (
 SOIL_PROTECTION_WARNING = (
     "soil_protection is a planning index: 70 × share of the season with a planned living crop + "
     "30 × share of crop transitions that change botanical family (heuristic weights). It is not "
-    "a measurement of soil health nor a forecast of organic matter, and it does not change the "
-    "ranking."
+    "a measurement of soil health nor a forecast of organic matter."
+)
+PRIORITIES_WARNING = (
+    "Rotations are ranked by the mean of the enabled priorities ({enabled}). Scores are absolute "
+    "0–100 scales (0 = worst possible, 100 = best possible) and do not depend on the priorities: "
+    "productivity is the mean preserved yield and water_security the share of seasons without a "
+    "critical loss, both for the worse of the two crops."
+)
+NO_PRIORITIES_WARNING = (
+    "Every priority is off: rotations are ranked by the worse individual water risk."
+)
+LONG_CYCLE_WARNING = (
+    "The soil_protection priority favors long cycles that keep the soil covered until late in "
+    "the season, which usually carry more water risk; combine it with productivity or "
+    "water_security."
 )
 NO_HISTORY_WARNING = (
     "Without crop_history only the A→B transition is counted; recommended rotations always "
@@ -257,6 +276,7 @@ def crop_risk(
             loss_threshold_pct=threshold_pct,
             critical_stage=None,
             mean_isna=MeanIsna(initial=None, development=None, mid_season=None, late_season=None),
+            mean_season_isna=None,
             valid_years=len(valid),
             method="FAO56_SIMPLIFIED_KY",
         )
@@ -282,6 +302,16 @@ def crop_risk(
         loss_threshold_pct=threshold_pct,
         critical_stage=_most_common_stage(valid),
         mean_isna=MeanIsna(**mean_isna),
+        mean_season_isna=_round(
+            _mean(
+                [
+                    satisfaction
+                    for result in valid
+                    if (satisfaction := result.season_water_satisfaction_index) is not None
+                ]
+            ),
+            3,
+        ),
         valid_years=len(valid),
         method="FAO56_SIMPLIFIED_KY",
     )
@@ -505,6 +535,47 @@ def rank_rotations(
 ) -> list[RankedRotation]:
     """Best planting date of every viable ordered pair (A → B), sorted from lowest risk.
 
+    Ranking by water risk only (every priority off); see `rotation_candidates`.
+    """
+    candidates = rotation_candidates(
+        crops,
+        climate_days,
+        season_years,
+        soil,
+        agricultural_year,
+        initial_water_fraction,
+        calendars,
+    )
+    return _best_per_pair(sorted(candidates, key=lambda ranked: ranked.ranking_key))
+
+
+class _HasCropCodes(Protocol):
+    @property
+    def crop_codes(self) -> tuple[int, int]: ...
+
+
+def _best_per_pair[T: _HasCropCodes](ordered: Iterable[T]) -> list[T]:
+    """First item of each crop pair, keeping the order."""
+    seen: set[tuple[int, int]] = set()
+    best = []
+    for item in ordered:
+        if (pair := item.crop_codes) not in seen:
+            seen.add(pair)
+            best.append(item)
+    return best
+
+
+def rotation_candidates(
+    crops: Sequence[CropDetail],
+    climate_days: Sequence[DiaClima],
+    season_years: Sequence[int],
+    soil: SoilProfile | SoilType,
+    agricultural_year: int,
+    initial_water_fraction: float = INITIAL_SOIL_WATER_FRACTION,
+    calendars: Mapping[int, CropCalendar] | None = None,
+) -> list[RankedRotation]:
+    """Every viable ordered pair (A → B) on every viable planting date of A, unsorted.
+
     Dates are in `agricultural_year`; each one is simulated on the same day and month of every
     historical season in `season_years` (start years of Sep–Aug seasons). `calendars` (by
     EcoCrop code) set the cycle length and planting dates of each crop; crops without one use
@@ -530,7 +601,7 @@ def rank_rotations(
             )
         return suitable[key]
 
-    best_by_pair: dict[tuple[int, int], RankedRotation] = {}
+    rotations: list[RankedRotation] = []
     for crop_a in candidates:
         calendar_a = calendars.get(crop_a.eco_port_code)
         for first_planting in first_planting_dates(agricultural_year, calendar_a):
@@ -560,42 +631,127 @@ def rank_rotations(
                     )
                     risk_a = crop_risk([season.result for season in first_seasons])
                 risk_b = crop_risk(_simulate_second_crop(crop_b, first_seasons, climate, soil))
-                ranked = RankedRotation(
-                    ranking_key=rank_key(risk_a, risk_b, first_planting, crop_codes),
-                    first=_rotation_crop(
-                        crop_a, risk_a, first_planting, calendar_a, agricultural_year
-                    ),
-                    second=_rotation_crop(
-                        crop_b, risk_b, planting_b, calendar_b, agricultural_year
-                    ),
+                rotations.append(
+                    RankedRotation(
+                        ranking_key=rank_key(risk_a, risk_b, first_planting, crop_codes),
+                        first=_rotation_crop(
+                            crop_a, risk_a, first_planting, calendar_a, agricultural_year
+                        ),
+                        second=_rotation_crop(
+                            crop_b, risk_b, planting_b, calendar_b, agricultural_year
+                        ),
+                    )
                 )
-                best = best_by_pair.get(crop_codes)
-                if best is None or ranked.ranking_key < best.ranking_key:
-                    best_by_pair[crop_codes] = ranked
-    return sorted(best_by_pair.values(), key=lambda ranked: ranked.ranking_key)
+    return rotations
 
 
-def _rotation(
-    rank: int,
-    ranked: RankedRotation,
+# --- Priorities -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ScoredRotation:
+    ranked: RankedRotation
+    soil_protection: SoilProtection
+    scores: RotationScores
+    indicators: Mapping[str, float | None]  # unrounded scores, by priority name
+
+    @property
+    def crop_codes(self) -> tuple[int, int]:
+        return self.ranked.crop_codes
+
+
+def _worst(values: Sequence[float | None]) -> float | None:
+    return None if None in values else min(values)  # type: ignore[type-var]
+
+
+def _mean_or_none(values: Sequence[float | None]) -> float | None:
+    return None if not values or None in values else statistics.fmean(values)  # type: ignore[arg-type]
+
+
+def rotation_indicators(
+    ranked: RankedRotation, protection: SoilProtection
+) -> dict[str, float | None]:
+    """Unrounded absolute 0–100 indicators (worse crop for productivity and water security)."""
+    risks = [rotation_crop.crop.risk for rotation_crop in (ranked.first, ranked.second)]
+    return {
+        "productivity": _worst(
+            [
+                None
+                if risk.estimated_yield_loss_pct is None
+                else 100 - risk.estimated_yield_loss_pct
+                for risk in risks
+            ]
+        ),
+        "water_security": _worst(
+            [None if risk.risk_percentage is None else 100 - risk.risk_percentage for risk in risks]
+        ),
+        "soil_protection": exact_value(protection),
+    }
+
+
+def rotation_scores(indicators: Mapping[str, float | None]) -> RotationScores:
+    """Displayed scores: the same whatever priorities are enabled (they only set the order)."""
+    return RotationScores(
+        productivity=_round(indicators["productivity"], 1),
+        water_security=_round(indicators["water_security"], 1),
+        soil_protection=round(indicators["soil_protection"] or 0.0, 1),
+        overall=_round(_mean_or_none(list(indicators.values())), 1),
+    )
+
+
+def priority_value(indicators: Mapping[str, float | None], priorities: Priorities) -> float | None:
+    """Mean of the enabled indicators: sorts the rotations, not returned to the client."""
+    return _mean_or_none([indicators[name] for name in priorities.enabled()])
+
+
+def _priority_key(scored: ScoredRotation, priorities: Priorities) -> tuple:
+    """Highest enabled mean first, unknown last, then water risk; only risk with none enabled."""
+    if not priorities.enabled():
+        return (scored.ranked.ranking_key,)
+    value = priority_value(scored.indicators, priorities)
+    return (value is None, -(value or 0.0), scored.ranked.ranking_key)
+
+
+def select_rotations(
+    candidates: Sequence[RankedRotation],
+    priorities: Priorities,
+    history_families: Sequence[str],
     agricultural_year: int,
-    history_families: Sequence[str] = (),
-) -> Rotation:
-    first_code, second_code = ranked.crop_codes
+) -> list[ScoredRotation]:
+    """Best planting date of every crop pair by the priorities, sorted from best."""
+    season_start = date(agricultural_year, *SEASON_START)
+    season_end = date(agricultural_year + 1, *SEASON_END)
+    scored = []
+    for ranked in candidates:
+        protection = rotation_soil_protection(ranked, history_families, season_start, season_end)
+        indicators = rotation_indicators(ranked, protection)
+        scored.append(ScoredRotation(ranked, protection, rotation_scores(indicators), indicators))
+    scored.sort(key=lambda item: _priority_key(item, priorities))
+    return _best_per_pair(scored)
+
+
+def rotation_soil_protection(
+    ranked: RankedRotation,
+    history_families: Sequence[str],
+    season_start: date,
+    season_end: date,
+) -> SoilProtection:
     planned = [
         (rotation_crop.planting_date, rotation_crop.harvest_date, rotation_crop.crop.family or "")
         for rotation_crop in (ranked.first, ranked.second)
     ]
+    return soil_protection(planned, history_families, season_start, season_end)
+
+
+def _rotation(rank: int, scored: ScoredRotation) -> Rotation:
+    ranked = scored.ranked
+    first_code, second_code = ranked.crop_codes
     return Rotation(
         id=f"{first_code}-{second_code}-{ranked.first.planting_date:%Y-%m-%d}",
         rank=rank,
         crops=[ranked.first, ranked.second],
-        soil_protection=soil_protection(
-            planned,
-            history_families,
-            date(agricultural_year, *SEASON_START),
-            date(agricultural_year + 1, *SEASON_END),
-        ),
+        soil_protection=scored.soil_protection,
+        scores=scored.scores,
     )
 
 
@@ -618,7 +774,7 @@ def top_sequences(ranked: Sequence[RankedRotation]) -> list[tuple[tuple[int, int
 
 
 class _RankingCache:
-    """Small thread-safe LRU of rankings (requests run in a thread pool)."""
+    """Small thread-safe LRU of simulated candidates (requests run in a thread pool)."""
 
     def __init__(self, max_size: int) -> None:
         self._items: OrderedDict[Hashable, list[RankedRotation]] = OrderedDict()
@@ -705,11 +861,12 @@ def recommendations(
     soil_properties: SoilProperties | None = None,
     soil_properties_error: str | None = None,
 ) -> RotationRecommendationsResponse:
-    """Top rotations for the request, with assumptions and warnings.
+    """Top rotations for the request, ranked by its priorities, with assumptions and warnings.
 
-    `climate_key` identifies the climate series (e.g. the POWER cell). When given, the ranking is
-    cached: it depends only on the climate, soil, crop calendars, agricultural year and seasons
-    (a few seconds to compute on 30 seasons).
+    `climate_key` identifies the climate series (e.g. the POWER cell). When given, the simulated
+    candidates are cached: they depend only on the climate, soil, crop calendars, agricultural
+    year and seasons (a few seconds to compute on 30 seasons). Priorities and crop_history only
+    re-score them.
     """
     year = request.agricultural_year or next_agricultural_year(today)
     previous_families = history_families(repository, request.crop_history)
@@ -725,12 +882,15 @@ def recommendations(
         if climate_key is None
         else (climate_key, profile, tuple(sorted(calendars.items())), year, tuple(season_years))
     )
-    ranked = _ranking_cache.get(cache_key)
-    if ranked is None:
-        ranked = rank_rotations(
+    candidates = _ranking_cache.get(cache_key)
+    if candidates is None:
+        candidates = rotation_candidates(
             crops, climate_days, season_years, profile, year, calendars=calendars
         )
-        _ranking_cache.put(cache_key, ranked)
+        _ranking_cache.put(cache_key, candidates)
+    # Priorities and crop_history only re-score the cached candidates (no new simulation).
+    priorities = request.priorities
+    ranked = select_rotations(candidates, priorities, previous_families, year)
     without_calendar = [
         crop.water_requirements.profile_name
         for crop in crops
@@ -747,6 +907,13 @@ def recommendations(
         SOILGRIDS_WARNING if soil.source == "SOILGRIDS_SAXTON_RAWLS_2006" else SOIL_CLASS_WARNING,
         SOIL_PROTECTION_WARNING,
     ]
+    enabled = priorities.enabled()
+    if enabled:
+        warnings.append(PRIORITIES_WARNING.format(enabled=", ".join(enabled)))
+    else:
+        warnings.append(NO_PRIORITIES_WARNING)
+    if priorities.soil_protection:
+        warnings.append(LONG_CYCLE_WARNING)
     if not request.crop_history:
         warnings.append(NO_HISTORY_WARNING)
     if soil_properties is not None:
@@ -768,8 +935,9 @@ def recommendations(
         soil_type=soil.texture_class,
         soil=soil,
         soil_properties=soil_properties,
+        priorities=priorities,
         rotations=[
-            _rotation(rank, rotation, year, previous_families)
+            _rotation(rank, rotation)
             for rank, rotation in enumerate(ranked[:MAX_ROTATIONS], start=1)
         ],
         assumptions=RotationAssumptions(
