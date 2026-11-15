@@ -17,39 +17,48 @@ import threading
 from bisect import bisect_left, bisect_right
 from collections import Counter, OrderedDict
 from collections.abc import Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
-from typing import Protocol
+from typing import Literal, Protocol
 
 from app.schemas.crop import CropDetail, WaterRequirements
 from app.schemas.rotation import (
     CropCalendarInfo,
     CropRisk,
     CropWithRisk,
+    CustomRotation,
+    CustomRotationInput,
     MeanIsna,
+    PlantingSweep,
     Priorities,
     Rotation,
     RotationAssumptions,
+    RotationContext,
     RotationCrop,
     RotationRecommendationsResponse,
     RotationRequest,
     RotationScores,
+    RotationSimulationRequest,
+    RotationSimulationResponse,
     SoilInfo,
     SoilProperties,
     SoilProtection,
     Stage,
+    SweepCrop,
+    SweepPoint,
 )
 from app.schemas.rotation import Location as LocationSchema
-from app.services.agro import MIN_SAFRAS_VALIDAS, DiaClima
+from app.services.agro import MIN_SAFRAS_VALIDAS, DiaClima, decendio_idx
 from app.services.crop_calendar import (
     CALENDAR_SOURCE,
     CropCalendar,
     apply_calendar,
     crop_calendars,
+    scale_stage_lengths,
 )
-from app.services.ecocrop import CropRepository
+from app.services.ecocrop import CropRepository, is_simulable
 from app.services.soil import SoilProfile, SoilType, saxton_rawls_2006, texture_class
-from app.services.soil_protection import exact_value, soil_protection
+from app.services.soil_protection import botanical_family, exact_value, soil_protection
 from app.services.soilgrids_client import ORGANIC_MATTER_PER_CARBON, SoilEstimate
 from app.services.water_balance import STAGES, CropSeasonResult, SoilCarryOver, simulate_phases
 
@@ -168,6 +177,12 @@ SOIL_PROPERTIES_WARNING = (
     "not replace a laboratory soil analysis."
 )
 SOIL_PROPERTIES_UNAVAILABLE_WARNING = "Soil properties panel unavailable: {reason}."
+CUSTOM_ROTATION_WARNING = (
+    "Custom rotations are simulated as sent, without the recommendation filters (botanical "
+    "family, temperature, regional calendar); issues are listed in their checks. Their rank is "
+    "the position they would take among the recommended rotations. A one-crop rotation is ranked "
+    "by the same indicators: the fallow after it lowers its soil_protection."
+)
 TEMPERATURE_FILTER_WARNING = (
     "Crops are pre-filtered by EcoCrop absolute temperature limits against the mean daily "
     "minimum/maximum over the cycle (coarse filter)."
@@ -240,7 +255,7 @@ def calendar_info(
         return CropCalendarInfo(source="FAO56_REFERENCE", cycle_days=_cycle_days(crop))
     return CropCalendarInfo(
         source=CALENDAR_SOURCE,
-        cycle_days=calendar.season_length_days,
+        cycle_days=_cycle_days(crop),
         reference_planting_date=calendar.planting_date(agricultural_year),
         data_source=calendar.data_source,
         grid_cell=LocationSchema(lat=calendar.cell_lat, lon=calendar.cell_lon),
@@ -329,11 +344,18 @@ def _most_common_stage(results: Sequence[CropSeasonResult]) -> Stage | None:
 
 
 def rank_key(
-    risk_a: CropRisk, risk_b: CropRisk, planting_date: date, crop_codes: tuple[int, int]
+    risk_a: CropRisk,
+    risk_b: CropRisk | None,
+    planting_date: date,
+    crop_codes: tuple[int, ...],
 ) -> tuple:
-    """Lowest worst individual risk first; unknown risk sorts last. No combined risk is exposed."""
-    risk_percentages = [risk.risk_percentage for risk in (risk_a, risk_b)]
-    yield_losses = [risk.estimated_yield_loss_pct for risk in (risk_a, risk_b)]
+    """Lowest worst individual risk first; unknown risk sorts last. No combined risk is exposed.
+
+    `risk_b` is None for a one-crop custom rotation.
+    """
+    risks = [risk for risk in (risk_a, risk_b) if risk is not None]
+    risk_percentages = [risk.risk_percentage for risk in risks]
+    yield_losses = [risk.estimated_yield_loss_pct for risk in risks]
     if None in risk_percentages or None in yield_losses:
         return (1, 0.0, 0.0, 0.0, planting_date, crop_codes)
     return (
@@ -350,11 +372,15 @@ def rank_key(
 class RankedRotation:
     ranking_key: tuple
     first: RotationCrop
-    second: RotationCrop
+    second: RotationCrop | None  # None only for a one-crop custom rotation
 
     @property
-    def crop_codes(self) -> tuple[int, int]:
-        return self.first.crop.eco_port_code, self.second.crop.eco_port_code
+    def crops(self) -> tuple[RotationCrop, ...]:
+        return (self.first,) if self.second is None else (self.first, self.second)
+
+    @property
+    def crop_codes(self) -> tuple[int, ...]:
+        return tuple(rotation_crop.crop.eco_port_code for rotation_crop in self.crops)
 
 
 class _Climate:
@@ -451,12 +477,16 @@ def _simulate_second_crop(
     first_seasons: Sequence[_FirstCropSeason],
     climate: _Climate,
     soil: SoilProfile | SoilType,
+    days_after_harvest: int = PLANTING_GAP_DAYS + 1,
 ) -> list[CropSeasonResult]:
-    """Fallow gap + crop B, continuing from the soil water left by crop A (no reset)."""
+    """Fallow gap + crop B, continuing from the soil water left by crop A (no reset).
+
+    B is planted `days_after_harvest` days after the harvest of A (default: the standard gap).
+    """
     results = []
     for first in first_seasons:
         simulation_start = first.harvest_date + timedelta(days=1)
-        planting = second_planting_date(first.harvest_date)
+        planting = first.harvest_date + timedelta(days=days_after_harvest)
         [result], _ = simulate_phases(
             climate.between(simulation_start, harvest_date(planting, crop)),
             simulation_start,
@@ -551,12 +581,12 @@ def rank_rotations(
 
 class _HasCropCodes(Protocol):
     @property
-    def crop_codes(self) -> tuple[int, int]: ...
+    def crop_codes(self) -> tuple[int, ...]: ...
 
 
 def _best_per_pair[T: _HasCropCodes](ordered: Iterable[T]) -> list[T]:
     """First item of each crop pair, keeping the order."""
-    seen: set[tuple[int, int]] = set()
+    seen: set[tuple[int, ...]] = set()
     best = []
     for item in ordered:
         if (pair := item.crop_codes) not in seen:
@@ -587,9 +617,7 @@ def rotation_candidates(
     candidates = [
         apply_calendar(crop, calendars.get(crop.eco_port_code))
         for crop in crops
-        if crop.family
-        and crop.water_requirements is not None
-        and crop.water_requirements.yield_response_factor.season is not None
+        if crop.family and is_simulable(crop)
     ]
     suitable: dict[tuple[int, date], bool] = {}
 
@@ -656,7 +684,7 @@ class ScoredRotation:
     indicators: Mapping[str, float | None]  # unrounded scores, by priority name
 
     @property
-    def crop_codes(self) -> tuple[int, int]:
+    def crop_codes(self) -> tuple[int, ...]:
         return self.ranked.crop_codes
 
 
@@ -672,7 +700,7 @@ def rotation_indicators(
     ranked: RankedRotation, protection: SoilProtection
 ) -> dict[str, float | None]:
     """Unrounded absolute 0–100 indicators (worse crop for productivity and water security)."""
-    risks = [rotation_crop.crop.risk for rotation_crop in (ranked.first, ranked.second)]
+    risks = [rotation_crop.crop.risk for rotation_crop in ranked.crops]
     return {
         "productivity": _worst(
             [
@@ -719,15 +747,23 @@ def select_rotations(
     agricultural_year: int,
 ) -> list[ScoredRotation]:
     """Best planting date of every crop pair by the priorities, sorted from best."""
-    season_start = date(agricultural_year, *SEASON_START)
-    season_end = date(agricultural_year + 1, *SEASON_END)
-    scored = []
-    for ranked in candidates:
-        protection = rotation_soil_protection(ranked, history_families, season_start, season_end)
-        indicators = rotation_indicators(ranked, protection)
-        scored.append(ScoredRotation(ranked, protection, rotation_scores(indicators), indicators))
+    scored = [score_rotation(ranked, history_families, agricultural_year) for ranked in candidates]
     scored.sort(key=lambda item: _priority_key(item, priorities))
     return _best_per_pair(scored)
+
+
+def score_rotation(
+    ranked: RankedRotation, history_families: Sequence[str], agricultural_year: int
+) -> ScoredRotation:
+    """Soil protection, indicators and displayed scores of one simulated rotation."""
+    protection = rotation_soil_protection(
+        ranked,
+        history_families,
+        date(agricultural_year, *SEASON_START),
+        date(agricultural_year + 1, *SEASON_END),
+    )
+    indicators = rotation_indicators(ranked, protection)
+    return ScoredRotation(ranked, protection, rotation_scores(indicators), indicators)
 
 
 def rotation_soil_protection(
@@ -738,7 +774,7 @@ def rotation_soil_protection(
 ) -> SoilProtection:
     planned = [
         (rotation_crop.planting_date, rotation_crop.harvest_date, rotation_crop.crop.family or "")
-        for rotation_crop in (ranked.first, ranked.second)
+        for rotation_crop in ranked.crops
     ]
     return soil_protection(planned, history_families, season_start, season_end)
 
@@ -749,7 +785,7 @@ def _rotation(rank: int, scored: ScoredRotation) -> Rotation:
     return Rotation(
         id=f"{first_code}-{second_code}-{ranked.first.planting_date:%Y-%m-%d}",
         rank=rank,
-        crops=[ranked.first, ranked.second],
+        crops=list(ranked.crops),
         soil_protection=scored.soil_protection,
         scores=scored.scores,
     )
@@ -766,7 +802,7 @@ def history_families(repository: CropRepository, crop_history: Sequence[int]) ->
     return families
 
 
-def top_sequences(ranked: Sequence[RankedRotation]) -> list[tuple[tuple[int, int], date]]:
+def top_sequences(ranked: Sequence[RankedRotation]) -> list[tuple[tuple[int, ...], date]]:
     """Crop pairs and planting dates of the recommended rotations, to compare rankings."""
     return [
         (rotation.crop_codes, rotation.first.planting_date) for rotation in ranked[:MAX_ROTATIONS]
@@ -850,18 +886,31 @@ def soil_properties_from_estimate(estimate: SoilEstimate) -> SoilProperties:
     )
 
 
-def recommendations(
+@dataclass(frozen=True)
+class RankingContext:
+    """Everything one request ranks against: soil, calendars, climate and the scored candidates."""
+
+    year: int
+    soil: SoilInfo
+    profile: SoilProfile
+    crops: list[CropDetail]
+    calendars: dict[int, CropCalendar]
+    climate: _Climate
+    season_years: Sequence[int]
+    previous_families: list[str]
+    ranked: list[ScoredRotation]  # best planting date of each crop pair, best first
+
+
+def ranking_context(
     repository: CropRepository,
-    request: RotationRequest,
+    request: RotationContext,
     climate_days: Sequence[DiaClima],
     season_years: Sequence[int],
     today: date,
     climate_key: Hashable | None = None,
     soil: SoilInfo | None = None,
-    soil_properties: SoilProperties | None = None,
-    soil_properties_error: str | None = None,
-) -> RotationRecommendationsResponse:
-    """Top rotations for the request, ranked by its priorities, with assumptions and warnings.
+) -> RankingContext:
+    """Simulate (or reuse from the cache) every candidate and rank them by the priorities.
 
     `climate_key` identifies the climate series (e.g. the POWER cell). When given, the simulated
     candidates are cached: they depend only on the climate, soil, crop calendars, agricultural
@@ -889,14 +938,33 @@ def recommendations(
         )
         _ranking_cache.put(cache_key, candidates)
     # Priorities and crop_history only re-score the cached candidates (no new simulation).
-    priorities = request.priorities
-    ranked = select_rotations(candidates, priorities, previous_families, year)
+    ranked = select_rotations(candidates, request.priorities, previous_families, year)
+    return RankingContext(
+        year=year,
+        soil=soil,
+        profile=profile,
+        crops=crops,
+        calendars=calendars,
+        climate=_Climate(climate_days),
+        season_years=season_years,
+        previous_families=previous_families,
+        ranked=ranked,
+    )
+
+
+def _warnings(
+    context: RankingContext,
+    request: RotationContext,
+    soil_properties: SoilProperties | None = None,
+    soil_properties_error: str | None = None,
+    custom: bool = False,
+) -> list[str]:
+    soil, priorities = context.soil, request.priorities
     without_calendar = [
         crop.water_requirements.profile_name
-        for crop in crops
-        if crop.eco_port_code not in calendars and crop.water_requirements is not None
+        for crop in context.crops
+        if crop.eco_port_code not in context.calendars and crop.water_requirements is not None
     ]
-
     warnings = [
         EXPERIMENTAL_WARNING,
         INITIAL_WATER_WARNING,
@@ -922,30 +990,447 @@ def recommendations(
         warnings.append(SOIL_PROPERTIES_UNAVAILABLE_WARNING.format(reason=soil_properties_error))
     if without_calendar:
         warnings.append(CYCLE_WARNING.format(crops=", ".join(without_calendar)))
-    if len(season_years) < MIN_SEASONS_FOR_STABLE_RISK:
+    seasons = len(context.season_years)
+    if seasons < MIN_SEASONS_FOR_STABLE_RISK:
         warnings.append(
-            f"Risk is based on only {len(season_years)} historical seasons; each season moves "
-            f"risk_percentage by about {100 / max(1, len(season_years)):.0f} points."
+            f"Risk is based on only {seasons} historical seasons; each season moves "
+            f"risk_percentage by about {100 / max(1, seasons):.0f} points."
         )
-    if not ranked:
+    if custom:
+        warnings.append(CUSTOM_ROTATION_WARNING)
+    return warnings
+
+
+def _assumptions() -> RotationAssumptions:
+    return RotationAssumptions(
+        loss_threshold_pct=LOSS_THRESHOLD_PCT,
+        initial_soil_water_fraction=INITIAL_SOIL_WATER_FRACTION,
+        spinup_days=SPINUP_DAYS,
+        planting_gap_days=PLANTING_GAP_DAYS,
+        planting_tolerance_days=PLANTING_TOLERANCE_DAYS,
+    )
+
+
+def recommendations(
+    repository: CropRepository,
+    request: RotationRequest,
+    climate_days: Sequence[DiaClima],
+    season_years: Sequence[int],
+    today: date,
+    climate_key: Hashable | None = None,
+    soil: SoilInfo | None = None,
+    soil_properties: SoilProperties | None = None,
+    soil_properties_error: str | None = None,
+) -> RotationRecommendationsResponse:
+    """Top rotations for the request, ranked by its priorities, with assumptions and warnings.
+
+    The request custom_rotations are simulated and placed in the same ranking (see
+    `ranking_context` for the cache). CustomRotationError for an invalid custom rotation.
+    """
+    context = ranking_context(
+        repository, request, climate_days, season_years, today, climate_key, soil
+    )
+    custom = [
+        custom_rotation(
+            context, resolve_custom_rotation(repository, item, context), request.priorities
+        )
+        for item in request.custom_rotations
+    ]
+    warnings = _warnings(
+        context, request, soil_properties, soil_properties_error, custom=bool(custom)
+    )
+    if not context.ranked:
         warnings.append("No viable rotation was found for this location and season.")
 
     return RotationRecommendationsResponse(
-        agricultural_year=year,
-        soil_type=soil.texture_class,
-        soil=soil,
+        agricultural_year=context.year,
+        soil_type=context.soil.texture_class,
+        soil=context.soil,
         soil_properties=soil_properties,
-        priorities=priorities,
+        priorities=request.priorities,
         rotations=[
             _rotation(rank, rotation)
-            for rank, rotation in enumerate(ranked[:MAX_ROTATIONS], start=1)
+            for rank, rotation in enumerate(context.ranked[:MAX_ROTATIONS], start=1)
         ],
-        assumptions=RotationAssumptions(
-            loss_threshold_pct=LOSS_THRESHOLD_PCT,
-            initial_soil_water_fraction=INITIAL_SOIL_WATER_FRACTION,
-            spinup_days=SPINUP_DAYS,
-            planting_gap_days=PLANTING_GAP_DAYS,
-            planting_tolerance_days=PLANTING_TOLERANCE_DAYS,
-        ),
+        custom_rotations=custom,
+        assumptions=_assumptions(),
         warnings=warnings,
+    )
+
+
+# --- Custom rotations -----------------------------------------------------------------------
+
+# Requested cycles are accepted within this share of the reference (regional or FAO-56) cycle:
+# beyond it, stretching the FAO-56 stage proportions no longer describes a real cultivar.
+CUSTOM_CYCLE_RANGE = (0.5, 1.5)
+# Default planting date of the first crop when it has no regional calendar (month, day).
+DEFAULT_FIRST_PLANTING = PLANTING_WINDOW_A[0]
+SEASON_MONTHS = ("Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug")
+
+
+class CustomRotationError(ValueError):
+    """A custom rotation that cannot be simulated (unknown crop, impossible dates)."""
+
+
+@dataclass(frozen=True)
+class CustomPlan:
+    """A custom rotation with every date resolved and the requested cycles applied."""
+
+    crop_a: CropDetail
+    planting_a: date
+    calendar_a: CropCalendar | None
+    # The second crop is optional: a one-crop rotation leaves the rest of the season fallow.
+    crop_b: CropDetail | None = None
+    planting_b: date | None = None
+    calendar_b: CropCalendar | None = None
+
+    @property
+    def harvest_a(self) -> date:
+        return harvest_date(self.planting_a, self.crop_a)
+
+    @property
+    def last_harvest(self) -> date:
+        if self.crop_b is None or self.planting_b is None:
+            return self.harvest_a
+        return harvest_date(self.planting_b, self.crop_b)
+
+    @property
+    def days_after_harvest(self) -> int:
+        """Days from the harvest of A to the planting of B."""
+        if self.planting_b is None:
+            raise ValueError("one-crop rotation has no second planting")
+        return (self.planting_b - self.harvest_a).days
+
+    @property
+    def crop_codes(self) -> tuple[int, ...]:
+        crops = (self.crop_a,) if self.crop_b is None else (self.crop_a, self.crop_b)
+        return tuple(crop.eco_port_code for crop in crops)
+
+    def planted_crops(self) -> list[tuple[CropDetail, date, CropCalendar | None]]:
+        planted = [(self.crop_a, self.planting_a, self.calendar_a)]
+        if self.crop_b is not None and self.planting_b is not None:
+            planted.append((self.crop_b, self.planting_b, self.calendar_b))
+        return planted
+
+    def with_second_planting(self, planting_b: date) -> "CustomPlan":
+        return replace(self, planting_b=planting_b)
+
+
+def with_cycle(crop: CropDetail, cycle_days: int) -> CropDetail:
+    """Copy of the crop with its FAO-56 stages stretched to `cycle_days`."""
+    requirements = _water_requirements(crop)
+    if requirements.stage_length_days.total == cycle_days:
+        return crop
+    stages = scale_stage_lengths(requirements.stage_length_days, cycle_days)
+    return crop.model_copy(
+        update={"water_requirements": requirements.model_copy(update={"stage_length_days": stages})}
+    )
+
+
+def _custom_crop(
+    repository: CropRepository,
+    code: int,
+    planting: date,
+    harvest: date | None,
+    calendar: CropCalendar | None,
+) -> CropDetail:
+    crop = repository.get(code)
+    if crop is None:
+        raise CustomRotationError(f"custom rotation: unknown crop {code}")
+    if not is_simulable(crop):
+        raise CustomRotationError(
+            f"custom rotation: crop {code} ({_crop_name(crop)}) has no FAO-56 water profile and "
+            "cannot be simulated; list simulable crops with GET /crops?simulable=true"
+        )
+    crop = apply_calendar(crop, calendar)
+    if harvest is None:
+        return crop
+    if harvest <= planting:
+        raise CustomRotationError(
+            f"custom rotation: crop {code} harvest_date must be after its planting_date"
+        )
+    cycle = (harvest - planting).days + 1
+    reference = _cycle_days(crop)
+    low, high = CUSTOM_CYCLE_RANGE
+    if not low * reference <= cycle <= high * reference:
+        raise CustomRotationError(
+            f"custom rotation: crop {code} cycle of {cycle} days is outside "
+            f"{low:.0%}–{high:.0%} of its reference cycle ({reference} days)"
+        )
+    return with_cycle(crop, cycle)
+
+
+def resolve_custom_rotation(
+    repository: CropRepository, rotation: CustomRotationInput, context: RankingContext
+) -> CustomPlan:
+    """Dates and cycles of a custom rotation; CustomRotationError when it cannot be simulated."""
+    year = context.year
+    season_start = date(year, *SEASON_START)
+    season_end = date(year + 1, *SEASON_END)
+    first, *rest = rotation.crops
+    calendar_a = context.calendars.get(first.code)
+
+    planting_a = first.planting_date or (
+        calendar_a.planting_date(year) if calendar_a else date(year, *DEFAULT_FIRST_PLANTING)
+    )
+    if not season_start <= planting_a <= season_end:
+        raise CustomRotationError(
+            f"custom rotation: the first crop must be planted inside the agricultural year "
+            f"({season_start} to {season_end})"
+        )
+    crop_a = _custom_crop(repository, first.code, planting_a, first.harvest_date, calendar_a)
+    if not rest:
+        return CustomPlan(crop_a, planting_a, calendar_a)
+    harvest_a = harvest_date(planting_a, crop_a)
+
+    [second] = rest
+    calendar_b = context.calendars.get(second.code)
+    planting_b = second.planting_date or second_planting_date(harvest_a)
+    if planting_b <= harvest_a:
+        raise CustomRotationError(
+            f"custom rotation: the second crop must be planted after the harvest of the first "
+            f"({harvest_a})"
+        )
+    if planting_b > season_end:
+        raise CustomRotationError(
+            f"custom rotation: the second crop must be planted by the end of the agricultural "
+            f"year ({season_end})"
+        )
+    crop_b = _custom_crop(repository, second.code, planting_b, second.harvest_date, calendar_b)
+    return CustomPlan(crop_a, planting_a, calendar_a, crop_b, planting_b, calendar_b)
+
+
+def _crop_name(crop: CropDetail) -> str:
+    return crop.common_names[0] if crop.common_names else crop.scientific_name
+
+
+def _temperature_ok(context: RankingContext, crop: CropDetail, planting: date) -> bool:
+    return _temperature_suitable(
+        crop, planting, context.climate, context.year, context.season_years
+    )
+
+
+def custom_checks(context: RankingContext, plan: CustomPlan) -> list[str]:
+    """Recommendation filters the custom rotation fails, as messages for the farmer."""
+    checks = []
+    family_a = plan.crop_a.family
+    if plan.crop_b is not None and family_a and family_a == plan.crop_b.family:
+        checks.append(
+            f"Both crops are {botanical_family(family_a)}: no botanical family change, which "
+            "favors carry-over of pests, diseases and nematodes."
+        )
+    for crop, planting, calendar in plan.planted_crops():
+        name = _crop_name(crop)
+        if not fits_calendar(planting, calendar) and calendar is not None:
+            checks.append(
+                f"{name}: planting on {planting} is {calendar.days_from_planting(planting)} days "
+                f"from the regional calendar date ({calendar.planting_date(context.year)}); "
+                f"recommendations accept up to {PLANTING_TOLERANCE_DAYS}."
+            )
+        if not _temperature_ok(context, crop, planting):
+            checks.append(
+                f"{name}: mean temperature over the cycle is outside its EcoCrop absolute limits."
+            )
+    season_end = date(context.year + 1, *SEASON_END)
+    if plan.last_harvest > season_end:
+        last_crop = plan.planted_crops()[-1][0]
+        checks.append(
+            f"{_crop_name(last_crop)} is harvested on {plan.last_harvest}, after the end of the "
+            f"agricultural year ({season_end})."
+        )
+    return checks
+
+
+def evaluate_plan(
+    context: RankingContext,
+    plan: CustomPlan,
+    first_seasons: Sequence[_FirstCropSeason] | None = None,
+) -> RankedRotation:
+    """Water risk of each crop of a custom rotation (`first_seasons` reuses crop A's run)."""
+    if first_seasons is None:
+        first_seasons = _simulate_first_crop(
+            plan.crop_a,
+            plan.planting_a,
+            context.climate,
+            context.year,
+            context.season_years,
+            context.profile,
+            INITIAL_SOIL_WATER_FRACTION,
+        )
+    risk_a = crop_risk([season.result for season in first_seasons])
+    first = _rotation_crop(plan.crop_a, risk_a, plan.planting_a, plan.calendar_a, context.year)
+    if plan.crop_b is None or plan.planting_b is None:
+        return RankedRotation(
+            ranking_key=rank_key(risk_a, None, plan.planting_a, plan.crop_codes),
+            first=first,
+            second=None,
+        )
+    risk_b = crop_risk(
+        _simulate_second_crop(
+            plan.crop_b, first_seasons, context.climate, context.profile, plan.days_after_harvest
+        )
+    )
+    return RankedRotation(
+        ranking_key=rank_key(risk_a, risk_b, plan.planting_a, plan.crop_codes),
+        first=first,
+        second=_rotation_crop(plan.crop_b, risk_b, plan.planting_b, plan.calendar_b, context.year),
+    )
+
+
+def rank_position(
+    scored: ScoredRotation, ranked: Sequence[ScoredRotation], priorities: Priorities
+) -> int:
+    """Position the rotation would take among `ranked` (1 = ahead of all of them)."""
+    key = _priority_key(scored, priorities)
+    return 1 + sum(_priority_key(other, priorities) < key for other in ranked)
+
+
+def custom_rotation(
+    context: RankingContext, plan: CustomPlan, priorities: Priorities
+) -> CustomRotation:
+    """Simulate a custom rotation and place it among the recommended ones."""
+    scored = score_rotation(evaluate_plan(context, plan), context.previous_families, context.year)
+    rank = rank_position(scored, context.ranked, priorities)
+    codes = "-".join(str(code) for code in plan.crop_codes)
+    return CustomRotation(
+        id=f"custom-{codes}-{plan.planting_a:%Y-%m-%d}",
+        rank=rank,
+        ranked_among=len(context.ranked) + 1,
+        would_be_recommended=rank <= MAX_ROTATIONS,
+        crops=list(scored.ranked.crops),
+        soil_protection=scored.soil_protection,
+        scores=scored.scores,
+        checks=custom_checks(context, plan),
+    )
+
+
+def decendio_starts(agricultural_year: int) -> list[date]:
+    """First day of each of the 36 decêndios (1st, 11th, 21st) from Sep 1 to Aug 21."""
+    starts = []
+    for offset in range(12):
+        month = (SEASON_START[0] - 1 + offset) % 12 + 1
+        year = agricultural_year if month >= SEASON_START[0] else agricultural_year + 1
+        starts.extend(date(year, month, day) for day in (1, 11, 21))
+    return starts
+
+
+def decendio_label(index: int) -> str:
+    month = SEASON_MONTHS[index // 3]
+    return f"{('1-10', '11-20', '21-end')[index % 3]} {month}"
+
+
+def _sweep_crop(
+    context: RankingContext,
+    rotation_crop: RotationCrop,
+    crop: CropDetail,
+    calendar: CropCalendar | None,
+) -> SweepCrop:
+    risk = rotation_crop.crop.risk
+    return SweepCrop(
+        code=crop.eco_port_code,
+        planting_date=rotation_crop.planting_date,
+        harvest_date=rotation_crop.harvest_date,
+        risk_percentage=risk.risk_percentage,
+        estimated_yield_loss_pct=risk.estimated_yield_loss_pct,
+        in_calendar=fits_calendar(rotation_crop.planting_date, calendar),
+        temperature_ok=_temperature_ok(context, crop, rotation_crop.planting_date),
+    )
+
+
+def planting_sweep(
+    context: RankingContext,
+    plan: CustomPlan,
+    priorities: Priorities,
+    moved_crop: Literal["first", "second"],
+) -> PlantingSweep:
+    """The rotation with the planting date of one crop on the start of every decêndio.
+
+    "first" moves only A: B keeps its planned dates, and points where A would be harvested on
+    or after the planting of B are left out. The result depends on A's cycle and B's dates, not
+    on A's planting date. "second" keeps A and moves B after its harvest (needs a second crop).
+    Points that end after Aug 31 are left out.
+    """
+    season_end = date(context.year + 1, *SEASON_END)
+    first_seasons: list[_FirstCropSeason] | None = None
+    points: list[SweepPoint] = []
+    keys: list[tuple[tuple, int]] = []
+    for start in decendio_starts(context.year):
+        if moved_crop == "first":
+            candidate, shared = replace(plan, planting_a=start), None
+            if candidate.planting_b is not None and candidate.harvest_a >= candidate.planting_b:
+                continue
+        else:
+            if start <= plan.harvest_a:
+                continue
+            candidate = plan.with_second_planting(start)
+            if first_seasons is None:
+                first_seasons = _simulate_first_crop(
+                    plan.crop_a,
+                    plan.planting_a,
+                    context.climate,
+                    context.year,
+                    context.season_years,
+                    context.profile,
+                    INITIAL_SOIL_WATER_FRACTION,
+                )
+            shared = first_seasons
+        if candidate.last_harvest > season_end:
+            continue
+        scored = score_rotation(
+            evaluate_plan(context, candidate, shared), context.previous_families, context.year
+        )
+        index = decendio_idx(start)
+        points.append(
+            SweepPoint(
+                decendio_idx=index,
+                label=decendio_label(index),
+                crops=[
+                    _sweep_crop(context, rotation_crop, crop, calendar)
+                    for rotation_crop, (crop, _, calendar) in zip(
+                        scored.ranked.crops, candidate.planted_crops(), strict=True
+                    )
+                ],
+                scores=scored.scores,
+            )
+        )
+        keys.append((_priority_key(scored, priorities), index))
+    return PlantingSweep(
+        moved_crop=moved_crop,
+        points=points,
+        best_decendio_idx=min(keys)[1] if keys else None,
+        worst_decendio_idx=max(keys)[1] if keys else None,
+    )
+
+
+def simulate_rotation(
+    repository: CropRepository,
+    request: RotationSimulationRequest,
+    climate_days: Sequence[DiaClima],
+    season_years: Sequence[int],
+    today: date,
+    climate_key: Hashable | None = None,
+    soil: SoilInfo | None = None,
+) -> RotationSimulationResponse:
+    """One custom rotation, its rank among the recommendations and, optionally, its sweeps."""
+    context = ranking_context(
+        repository, request, climate_days, season_years, today, climate_key, soil
+    )
+    plan = resolve_custom_rotation(repository, request.rotation, context)
+    priorities = request.priorities
+    return RotationSimulationResponse(
+        agricultural_year=context.year,
+        soil_type=context.soil.texture_class,
+        soil=context.soil,
+        priorities=priorities,
+        rotation=custom_rotation(context, plan, priorities),
+        first_planting_sweep=(
+            planting_sweep(context, plan, priorities, "first") if request.sweep else None
+        ),
+        second_planting_sweep=(
+            planting_sweep(context, plan, priorities, "second")
+            if request.sweep and plan.crop_b is not None
+            else None
+        ),
+        assumptions=_assumptions(),
+        warnings=_warnings(context, request, custom=True),
     )

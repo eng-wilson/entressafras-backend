@@ -107,3 +107,26 @@ def test_get_crop_without_water_profile_is_null() -> None:
 def test_search_summary_has_no_water_requirements() -> None:
     item = client.get("/api/crops", params={"q": "milho"}).json()["items"][0]
     assert "water_requirements" not in item
+
+
+def test_filter_simulable_crops() -> None:
+    body = client.get("/api/crops", params={"simulable": "true", "limit": 100}).json()
+    assert body["total"] == 22
+    assert all(item["simulable"] for item in body["items"])
+    codes = {item["eco_port_code"] for item in body["items"]}
+    assert {1150, 2175, 8418} <= codes
+    assert 801 not in codes  # sunn hemp (Crotalaria juncea) has no FAO-56 profile
+
+
+def test_filter_not_simulable_crops() -> None:
+    body = client.get("/api/crops", params={"simulable": "false", "q": "crotalaria"}).json()
+    assert body["total"] > 0
+    assert not any(item["simulable"] for item in body["items"])
+    everything = client.get("/api/crops", params={"simulable": "false"}).json()
+    assert everything["total"] == 2568 - 22
+
+
+def test_summary_flags_simulable_crops() -> None:
+    items = client.get("/api/crops", params={"q": "glycine max"}).json()["items"]
+    assert items[0]["eco_port_code"] == 1150
+    assert items[0]["simulable"] is True

@@ -20,6 +20,15 @@ def list_crops(
     category: Annotated[str | None, Query(description="Ex.: 'cereals & pseudocereals'")] = None,
     life_span: Annotated[str | None, Query(description="Ex.: 'annual', 'perennial'")] = None,
     life_form: Annotated[str | None, Query(description="Ex.: 'herb', 'tree', 'grass'")] = None,
+    simulable: Annotated[
+        bool | None,
+        Query(
+            description=(
+                "true: only crops with a FAO-56 water profile, usable in rotation simulations; "
+                "false: only crops without one"
+            )
+        ),
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> CropPage:
@@ -28,6 +37,7 @@ def list_crops(
         category=category,
         life_span=life_span,
         life_form=life_form,
+        simulable=simulable,
         limit=limit,
         offset=offset,
     )

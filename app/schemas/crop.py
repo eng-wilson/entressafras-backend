@@ -101,6 +101,12 @@ class CropSummary(BaseModel):
     common_names: list[str] = Field(description="Primeiros nomes populares (até 5)")
     category: list[str]
     life_span: list[str]
+    simulable: bool = Field(
+        description=(
+            "Has a FAO-56 water profile with a seasonal Ky, so it can be used in rotation "
+            "simulations (POST /rotations/simulate)"
+        )
+    )
 
 
 class CropDetail(BaseModel):

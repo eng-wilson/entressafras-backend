@@ -879,3 +879,277 @@ def test_best_planting_date_of_a_pair_follows_the_priorities(soy_maize) -> None:
     assert by_risk.ranked.first.planting_date == date(2027, 10, 1)
     [by_yield] = select_rotations(candidates, Priorities(**{**OFF, "productivity": 1}), [], 2027)
     assert by_yield.ranked.first.planting_date == date(2027, 10, 11)
+
+
+# --- Custom rotations and the planting sweep ------------------------------------------------
+
+SIMULATE_URL = "/api/rotations/simulate"
+CONTEXT = {**BODY, "agricultural_year": 2027}
+
+
+def _custom_input(rotation: dict) -> dict:
+    """Custom rotation input with the same crops and dates as a returned rotation."""
+    return {
+        "crops": [
+            {
+                "code": rotation_crop["crop"]["eco_port_code"],
+                "planting_date": rotation_crop["planting_date"],
+                "harvest_date": rotation_crop["harvest_date"],
+            }
+            for rotation_crop in rotation["crops"]
+        ]
+    }
+
+
+def _simulate(client: TestClient, rotation: dict, **extra) -> dict:
+    resp = client.post(SIMULATE_URL, json={**CONTEXT, "rotation": rotation, **extra})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def test_custom_rotation_equal_to_the_top_recommendation_ranks_first(
+    client: TestClient, body: dict
+) -> None:
+    top = body["rotations"][0]
+    simulated = _simulate(client, _custom_input(top), sweep=False)
+    rotation = simulated["rotation"]
+    assert rotation["rank"] == 1
+    assert rotation["would_be_recommended"] is True
+    assert rotation["scores"] == top["scores"]
+    assert rotation["checks"] == []
+    assert [c["crop"]["risk"] for c in rotation["crops"]] == [
+        c["crop"]["risk"] for c in top["crops"]
+    ]
+    assert simulated["first_planting_sweep"] is None
+    assert simulated["second_planting_sweep"] is None
+
+
+def test_custom_rotation_defaults_follow_the_regional_calendar(client: TestClient) -> None:
+    rotation = _simulate(client, {"crops": [{"code": SOYBEAN}, {"code": MILLET}]}, sweep=False)[
+        "rotation"
+    ]
+    first, second = rotation["crops"]
+    assert first["planting_date"] == first["calendar"]["reference_planting_date"]
+    harvest = date.fromisoformat(first["harvest_date"])
+    assert date.fromisoformat(second["planting_date"]) == harvest + timedelta(days=6)
+    assert rotation["id"] == f"custom-{SOYBEAN}-{MILLET}-{first['planting_date']}"
+    assert rotation["ranked_among"] >= rotation["rank"]
+
+
+def test_harvest_date_sets_the_cycle_length(client: TestClient) -> None:
+    planting = date(2027, 10, 21)
+    rotations = [
+        _simulate(
+            client,
+            {
+                "crops": [
+                    {
+                        "code": SOYBEAN,
+                        "planting_date": planting.isoformat(),
+                        "harvest_date": (planting + timedelta(days=cycle - 1)).isoformat(),
+                    },
+                    {"code": MAIZE},
+                ]
+            },
+            sweep=False,
+        )["rotation"]
+        for cycle in (90, 130)
+    ]
+    assert [r["crops"][0]["calendar"]["cycle_days"] for r in rotations] == [90, 130]
+    # A longer soybean pushes maize later: its risk changes.
+    assert rotations[0]["crops"][1]["planting_date"] < rotations[1]["crops"][1]["planting_date"]
+    assert rotations[0]["crops"][1]["crop"]["risk"] != rotations[1]["crops"][1]["crop"]["risk"]
+
+
+def test_custom_rotation_issues_are_checks_not_errors(client: TestClient) -> None:
+    rotation = _simulate(
+        client,
+        {
+            "crops": [
+                {"code": MAIZE, "planting_date": "2027-09-01"},
+                {"code": SORGHUM},
+            ]
+        },
+        sweep=False,
+    )["rotation"]
+    checks = " ".join(rotation["checks"])
+    assert "Poaceae" in checks
+    assert "regional calendar date" in checks
+    assert rotation["soil_protection"]["family_changes"] == 0
+
+
+@pytest.mark.parametrize(
+    "rotation",
+    [
+        {"crops": [{"code": 999999}, {"code": MILLET}]},
+        {
+            "crops": [
+                {"code": SOYBEAN, "planting_date": "2027-10-21", "harvest_date": "2027-10-01"},
+                {"code": MILLET},
+            ]
+        },
+        {
+            "crops": [
+                {"code": SOYBEAN, "planting_date": "2027-10-21", "harvest_date": "2028-06-30"},
+                {"code": MILLET},
+            ]
+        },
+        {
+            "crops": [
+                {"code": SOYBEAN, "planting_date": "2027-10-21"},
+                {"code": MILLET, "planting_date": "2027-12-01"},
+            ]
+        },
+        {"crops": [{"code": SOYBEAN, "planting_date": "2027-07-01"}, {"code": MILLET}]},
+        {"crops": []},
+        {"crops": [{"code": SOYBEAN}, {"code": MILLET}, {"code": COMMON_BEAN}]},
+    ],
+)
+def test_impossible_custom_rotations_are_rejected(client: TestClient, rotation: dict) -> None:
+    resp = client.post(SIMULATE_URL, json={**CONTEXT, "rotation": rotation, "sweep": False})
+    assert resp.status_code == 422, resp.text
+
+
+def test_planting_sweep_covers_the_decendios_that_fit_in_the_season(client: TestClient) -> None:
+    simulated = _simulate(client, {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]})
+    rotation = simulated["rotation"]
+    soybean_harvest = rotation["crops"][0]["harvest_date"]
+    planned_second = rotation["crops"][1]
+    for moved in ("first", "second"):
+        sweep = simulated[f"{moved}_planting_sweep"]
+        assert sweep["moved_crop"] == moved
+        points = sweep["points"]
+        assert points
+        indexes = [point["decendio_idx"] for point in points]
+        assert indexes == sorted(set(indexes))
+        assert {sweep["best_decendio_idx"], sweep["worst_decendio_idx"]} <= set(indexes)
+        for point in points:
+            first, second = point["crops"]
+            assert second["harvest_date"] <= "2028-08-31"
+            assert first["planting_date"][-2:] in {"01", "11", "21"} or moved == "second"
+            if moved == "first":
+                assert second["planting_date"] == planned_second["planting_date"]
+                assert second["harvest_date"] == planned_second["harvest_date"]
+                assert first["harvest_date"] < second["planting_date"]
+            else:
+                assert first["harvest_date"] == soybean_harvest
+                assert second["planting_date"] > soybean_harvest
+
+
+def test_planting_sweep_best_and_worst_follow_the_priorities(client: TestClient) -> None:
+    simulated = _simulate(
+        client,
+        {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]},
+        priorities={"productivity": 0, "water_security": 1, "soil_protection": 0},
+    )
+    points = {p["decendio_idx"]: p for p in simulated["first_planting_sweep"]["points"]}
+    security = [p["scores"]["water_security"] for p in points.values()]
+    sweep = simulated["first_planting_sweep"]
+    assert points[sweep["best_decendio_idx"]]["scores"]["water_security"] == max(security)
+    assert points[sweep["worst_decendio_idx"]]["scores"]["water_security"] == min(security)
+
+
+def test_recommendations_rank_custom_rotations_without_changing_the_top(
+    client: TestClient, body: dict
+) -> None:
+    custom = [_custom_input(body["rotations"][0]), {"crops": [{"code": SOYBEAN}, {"code": MILLET}]}]
+    resp = client.post(URL, json={**CONTEXT, "custom_rotations": custom})
+    assert resp.status_code == 200, resp.text
+    with_custom = resp.json()
+    assert with_custom["rotations"] == body["rotations"]
+    assert [r["rank"] for r in with_custom["custom_rotations"]][0] == 1
+    assert len(with_custom["custom_rotations"]) == 2
+    assert any("Custom rotations" in w for w in with_custom["warnings"])
+    assert body["custom_rotations"] == []
+
+
+def test_single_crop_custom_rotation_leaves_the_season_fallow(client: TestClient) -> None:
+    single = _simulate(client, {"crops": [{"code": SOYBEAN}]})
+    rotation = single["rotation"]
+    assert len(rotation["crops"]) == 1
+    assert rotation["id"] == f"custom-{SOYBEAN}-{rotation['crops'][0]['planting_date']}"
+    assert rotation["rank"] >= 1
+    assert single["second_planting_sweep"] is None
+    points = single["first_planting_sweep"]["points"]
+    assert points
+    assert all(len(point["crops"]) == 1 for point in points)
+    assert all(point["crops"][0]["harvest_date"] <= "2028-08-31" for point in points)
+
+    pair = _simulate(client, {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]}, sweep=False)
+    assert pair["rotation"]["crops"][0]["crop"]["risk"] == rotation["crops"][0]["crop"]["risk"]
+    single_cover = rotation["soil_protection"]["cover_fraction"]
+    assert single_cover < pair["rotation"]["soil_protection"]["cover_fraction"]
+
+
+def test_recommendations_accept_a_single_crop_custom_rotation(
+    client: TestClient, body: dict
+) -> None:
+    resp = client.post(URL, json={**CONTEXT, "custom_rotations": [{"crops": [{"code": SOYBEAN}]}]})
+    assert resp.status_code == 200, resp.text
+    with_custom = resp.json()
+    assert with_custom["rotations"] == body["rotations"]
+    [custom] = with_custom["custom_rotations"]
+    assert len(custom["crops"]) == 1
+
+
+def test_custom_rotation_with_a_crop_without_fao56_profile_points_to_the_filter(
+    client: TestClient,
+) -> None:
+    rotation = {"crops": [{"code": 801}]}  # sunn hemp
+    resp = client.post(SIMULATE_URL, json={**CONTEXT, "rotation": rotation, "sweep": False})
+    assert resp.status_code == 422
+    assert "simulable=true" in resp.json()["detail"]
+
+
+def _soybean_then(second_code: int, soybean_planting: str = "2027-10-21") -> dict:
+    """Soybean with a 123-day cycle, then a crop with fixed explicit dates."""
+    planting = date.fromisoformat(soybean_planting)
+    return {
+        "crops": [
+            {
+                "code": SOYBEAN,
+                "planting_date": soybean_planting,
+                "harvest_date": (planting + timedelta(days=122)).isoformat(),
+            },
+            {"code": second_code, "planting_date": "2028-02-21", "harvest_date": "2028-06-10"},
+        ]
+    }
+
+
+def test_first_planting_sweep_moves_only_the_first_crop(client: TestClient) -> None:
+    sweep = _simulate(client, _soybean_then(MAIZE))["first_planting_sweep"]
+    points = sweep["points"]
+    assert [point["decendio_idx"] for point in points] == [0, 1, 2, 3, 4, 5]
+    for point in points:
+        first, second = point["crops"]
+        assert first["harvest_date"] < second["planting_date"]
+        assert (second["planting_date"], second["harvest_date"]) == ("2028-02-21", "2028-06-10")
+
+
+def test_first_planting_sweep_depends_on_the_cycle_not_on_the_planting_date(
+    client: TestClient,
+) -> None:
+    early = _simulate(client, _soybean_then(MAIZE, "2027-10-01"))["first_planting_sweep"]
+    late = _simulate(client, _soybean_then(MAIZE, "2027-10-21"))["first_planting_sweep"]
+    assert early == late
+    # Planting moved, harvest kept: a longer cycle is another management window.
+    longer = _soybean_then(MAIZE, "2027-10-21")
+    longer["crops"][0]["planting_date"] = "2027-10-11"
+    changed = _simulate(client, longer)["first_planting_sweep"]
+    assert changed["points"] != late["points"]
+
+
+def test_sweep_points_match_the_exact_simulation(client: TestClient) -> None:
+    simulated = _simulate(client, _soybean_then(SORGHUM))
+    for name in ("first_planting_sweep", "second_planting_sweep"):
+        points = simulated[name]["points"]
+        assert points
+        for point in (points[0], points[len(points) // 2], points[-1]):
+            crops = [
+                {key: crop[key] for key in ("code", "planting_date", "harvest_date")}
+                for crop in point["crops"]
+            ]
+            exact = _simulate(client, {"crops": crops}, sweep=False)["rotation"]["crops"]
+            assert [crop["risk_percentage"] for crop in point["crops"]] == [
+                crop["crop"]["risk"]["risk_percentage"] for crop in exact
+            ]

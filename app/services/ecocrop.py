@@ -112,6 +112,12 @@ def parse_row(row: dict[str, str]) -> CropDetail:
     )
 
 
+def is_simulable(crop: CropDetail) -> bool:
+    """Whether the water balance can simulate the crop (FAO-56 profile with a seasonal Ky)."""
+    requirements = crop.water_requirements
+    return requirements is not None and requirements.yield_response_factor.season is not None
+
+
 @dataclass(frozen=True)
 class _Entry:
     crop: CropDetail
@@ -160,6 +166,7 @@ class CropRepository:
         category: str | None = None,
         life_span: str | None = None,
         life_form: str | None = None,
+        simulable: bool | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[int, list[CropSummary]]:
@@ -177,6 +184,8 @@ class CropRepository:
         ranked: list[tuple[int, int, _Entry]] = []
         for index, entry in enumerate(self._entries):
             if any(value not in getattr(entry, attr) for attr, value in filters):
+                continue
+            if simulable is not None and is_simulable(entry.crop) != simulable:
                 continue
             rank = _match_rank(term, entry.names) if term else 0
             if rank is not None:
@@ -207,6 +216,7 @@ def _summary(crop: CropDetail) -> CropSummary:
         common_names=crop.common_names[:SUMMARY_NAMES],
         category=crop.category,
         life_span=crop.life_span,
+        simulable=is_simulable(crop),
     )
 
 

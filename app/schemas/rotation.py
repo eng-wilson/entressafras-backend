@@ -1,4 +1,4 @@
-"""Contract of POST /rotations/recommendations.
+"""Contract of POST /rotations/recommendations and POST /rotations/simulate.
 
 Risk is reported per crop only: there is deliberately no combined/rotation-level risk field.
 Rotation `scores` are 0–100 indicators (higher is better) used to rank by the client priorities.
@@ -45,7 +45,39 @@ class Priorities(BaseModel):
         return [name for name, value in self.model_dump().items() if value]
 
 
-class RotationRequest(BaseModel):
+class CustomCropInput(BaseModel):
+    """One crop of a client-defined rotation. Omitted dates follow the regional calendar."""
+
+    code: int = Field(description="EcoCrop code (see GET /crops); needs FAO-56 water data")
+    planting_date: date | None = Field(
+        None,
+        description=(
+            "First crop: default is the regional calendar date (or Oct 1 without one). "
+            "Second crop: default is the standard gap after the harvest of the first."
+        ),
+    )
+    harvest_date: date | None = Field(
+        None,
+        description=(
+            "Last day of the cycle; sets the cycle length (cultivar maturity). Default: the "
+            "regional cycle length. Must stay within 50–150% of it."
+        ),
+    )
+
+
+class CustomRotationInput(BaseModel):
+    """A two-crop rotation proposed by the client, to be simulated and ranked."""
+
+    crops: list[CustomCropInput] = Field(
+        min_length=1,
+        max_length=2,
+        description="1 or 2 crops, in planting order (one crop leaves the season fallow after it)",
+    )
+
+
+class RotationContext(BaseModel):
+    """Fields shared by the recommendation and the simulation requests."""
+
     soil_type: SoilType | None = Field(
         None,
         description=(
@@ -73,6 +105,28 @@ class RotationRequest(BaseModel):
     priorities: Priorities = Field(
         default_factory=Priorities,
         description="Indicators that rank the rotations (0 = off, 1 = on); all on by default",
+    )
+
+
+class RotationRequest(RotationContext):
+    custom_rotations: list[CustomRotationInput] = Field(
+        default_factory=list,
+        max_length=3,
+        description=(
+            "Client-defined rotations to simulate and place in the same ranking. They are "
+            "returned in `custom_rotations` and never change the recommended `rotations`."
+        ),
+    )
+
+
+class RotationSimulationRequest(RotationContext):
+    rotation: CustomRotationInput
+    sweep: bool = Field(
+        True,
+        description=(
+            "Also simulate the planting date of each crop on every decêndio of the season "
+            "(about 1 s). Send false to evaluate only the given dates (fast, e.g. while dragging)."
+        ),
     )
 
 
@@ -212,6 +266,71 @@ class Rotation(BaseModel):
     scores: RotationScores
 
 
+class CustomRotation(BaseModel):
+    """A client-defined rotation, with the position it would take in the ranking.
+
+    Unlike the recommended rotations it is not filtered: problems such as same botanical family,
+    temperature or a planting date far from the regional calendar are listed in `checks`.
+    """
+
+    id: str
+    rank: int = Field(
+        ge=1,
+        description=(
+            "Position among the recommended rotations (best planting date of each crop pair) "
+            "under the request priorities; 1 = better than all of them"
+        ),
+    )
+    ranked_among: int = Field(description="Rotations compared, this one included")
+    would_be_recommended: bool = Field(description="rank is within the top 4")
+    crops: list[RotationCrop] = Field(
+        min_length=1, max_length=2, description="1 or 2 crops, in planting order"
+    )
+    soil_protection: SoilProtection
+    scores: RotationScores
+    checks: list[str] = Field(
+        description="Agronomic issues found (empty = passes the recommendation filters)"
+    )
+
+
+class SweepCrop(BaseModel):
+    code: int
+    planting_date: date
+    harvest_date: date
+    risk_percentage: float | None
+    estimated_yield_loss_pct: float | None
+    in_calendar: bool = Field(
+        description="Planting within planting_tolerance_days of the regional calendar date"
+    )
+    temperature_ok: bool = Field(description="Passes the EcoCrop temperature filter")
+
+
+class SweepPoint(BaseModel):
+    decendio_idx: int = Field(description="0 = 1–10 Sep … 35 = 21–31 Aug")
+    label: str
+    crops: list[SweepCrop] = Field(
+        min_length=1, max_length=2, description="1 or 2 crops, in planting order"
+    )
+    scores: RotationScores
+
+
+class PlantingSweep(BaseModel):
+    """The same rotation with one planting date moved to the start of each decêndio.
+
+    Cycle lengths stay as requested. Only decêndios whose rotation ends by Aug 31 are listed.
+    """
+
+    moved_crop: Literal["first", "second"] = Field(
+        description=(
+            "first: only the first crop moves (the second keeps its dates); second: the first "
+            "crop is fixed and only the second one moves"
+        )
+    )
+    points: list[SweepPoint]
+    best_decendio_idx: int | None = Field(description="Best point by the request priorities")
+    worst_decendio_idx: int | None
+
+
 class RotationAssumptions(BaseModel):
     loss_threshold_pct: float
     initial_soil_water_fraction: float = Field(description="Of available water capacity")
@@ -268,5 +387,22 @@ class RotationRecommendationsResponse(BaseModel):
     )
     priorities: Priorities = Field(description="Priorities used in the ranking")
     rotations: list[Rotation] = Field(max_length=4)
+    custom_rotations: list[CustomRotation] = Field(
+        default_factory=list, description="The request custom_rotations, simulated and ranked"
+    )
+    assumptions: RotationAssumptions
+    warnings: list[str]
+
+
+class RotationSimulationResponse(BaseModel):
+    agricultural_year: int
+    soil_type: SoilType
+    soil: SoilInfo
+    priorities: Priorities
+    rotation: CustomRotation
+    first_planting_sweep: PlantingSweep | None = Field(None, description="Null when sweep is false")
+    second_planting_sweep: PlantingSweep | None = Field(
+        None, description="Null when sweep is false or the rotation has a single crop"
+    )
     assumptions: RotationAssumptions
     warnings: list[str]

@@ -42,7 +42,7 @@ SORRISO = (-12.55, -55.72)
 
 def _describe(rank: int, rotation: RankedRotation) -> str:
     parts = []
-    for rotation_crop in (rotation.first, rotation.second):
+    for rotation_crop in rotation.crops:
         risk = rotation_crop.crop.risk
         name = rotation_crop.crop.water_requirements.profile
         parts.append(
