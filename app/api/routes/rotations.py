@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import date
 from typing import Annotated, NamedTuple
 
@@ -17,6 +18,7 @@ from app.schemas.rotation import (
     SoilInfo,
     SoilProperties,
 )
+from app.services.climate_scenario import SCENARIOS, apply_scenario
 from app.services.ecocrop import CropRepository, get_repository
 from app.services.fallback import distance_km
 from app.services.power_client import (
@@ -204,7 +206,7 @@ async def recommend_rotations(
             series.dias,
             inputs.season_years,
             today,
-            (series.lat, series.lon),
+            (series.lat, series.lon, request.climate_scenario),
             soil.soil,
             soil.properties,
             soil.properties_error,
@@ -243,7 +245,7 @@ async def simulate(
             series.dias,
             inputs.season_years,
             today,
-            (series.lat, series.lon),
+            (series.lat, series.lon, request.climate_scenario),
             inputs.soil.soil,
         )
     except CustomRotationError as exc:
@@ -274,5 +276,9 @@ async def _inputs(
         _climate(client, request.location.lat, request.location.lon, window),
         _soil(soilgrids, request, need_soil_properties),
     )
+    scenario = SCENARIOS[request.climate_scenario]
+    if not scenario.is_historical:
+        days = apply_scenario(series.dias, scenario, elev=series.elev, lat=series.lat)
+        series = replace(series, dias=days)
     warnings = [warning for warning in (climate_warning, soil.warning) if warning]
     return Inputs(series, season_years, soil, warnings)

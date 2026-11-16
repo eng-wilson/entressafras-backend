@@ -38,7 +38,7 @@ POST /api/rotations/recommendations
 | `productivity` | `1` | `scores.productivity` | Produtividade preservada: 100 − perda média de rendimento por falta de água (FAO Ky), da **pior** das culturas da rotação. 100 = sem perda. |
 | `water_security` | `1` | `scores.water_security` | % de safras históricas (30 anos) sem perda crítica (> `assumptions.loss_threshold_pct`, hoje 20%), da **pior** cultura. 100 = nenhuma safra crítica. |
 | `soil_protection` | `1` | `scores.soil_protection` | Cobertura do solo planejada e troca de família botânica: 70% cobertura + 30% diversidade. 100 = solo coberto todos os dias e toda transição muda de família. |
-| `revenue` | `0` | `scores.revenue` | Faturamento bruto de referência (preço ao produtor × produtividade, média do Brasil, FAOSTAT), com cada cultura descontada pela sua perda hídrica no local. A nota é dividida pelo teto, que são as duas culturas de maior faturamento do catálogo (hoje algodão + amendoim, ~US$ 5.876/ha). 100 = esse par sem perda. |
+| `revenue` | `0` | `scores.revenue` | Faturamento bruto de referência (preço ao produtor × produtividade, média do Brasil, FAOSTAT), com cada cultura descontada pela sua perda hídrica no local. A nota é dividida pelo teto, que é o maior faturamento bruto, sem perda, entre as rotações viáveis no local. O teto muda conforme o local. 100 = a melhor rotação viável do local sem perda hídrica; uma rotação customizada acima do teto fica em 100. |
 
 ### Regras de entrada
 

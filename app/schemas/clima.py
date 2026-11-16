@@ -2,6 +2,8 @@ from datetime import date
 
 from pydantic import BaseModel, Field
 
+from app.services.climate_scenario import ScenarioId
+
 AVISO_RESOLUCAO = (
     "Dados do NASA POWER numa grade de ~50 km (0,5° × 0,625°): o resultado vale para a região, "
     "não para o talhão. Talhões vizinhos caem na mesma célula."
@@ -89,3 +91,15 @@ class ClimaDiario(BaseModel):
     fonte: str = FONTE
     aviso_resolucao: str = AVISO_RESOLUCAO
     dias: list[Dia]
+
+
+class ClimateScenarioInfo(BaseModel):
+    """Climate scenario applied to the historical series (delta method)."""
+
+    id: ScenarioId
+    label: str
+    delta_temp_c: float = Field(description="Added to daily Tmax and Tmin, °C")
+    rain_change_pct: float = Field(description="Change applied to daily rainfall, %")
+    onset_delay_days: int = Field(description="Days the 15 Aug–31 Dec rainfall is shifted later")
+    description: str
+    source: str

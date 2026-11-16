@@ -17,10 +17,11 @@ import threading
 from bisect import bisect_left, bisect_right
 from collections import Counter, OrderedDict
 from collections.abc import Hashable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, timedelta
 from typing import Literal, Protocol
 
+from app.schemas.clima import ClimateScenarioInfo
 from app.schemas.crop import CropDetail, WaterRequirements
 from app.schemas.rotation import (
     CropCalendarInfo,
@@ -49,6 +50,7 @@ from app.schemas.rotation import (
 )
 from app.schemas.rotation import Location as LocationSchema
 from app.services.agro import MIN_SAFRAS_VALIDAS, DiaClima, decendio_idx
+from app.services.climate_scenario import SCENARIOS
 from app.services.crop_calendar import (
     CALENDAR_SOURCE,
     CropCalendar,
@@ -58,7 +60,7 @@ from app.services.crop_calendar import (
 )
 from app.services.crop_economics import (
     crop_economics,
-    revenue_scale_max,
+    revenue_ceiling,
     rotation_gross_revenue,
     water_adjusted_revenue,
 )
@@ -723,9 +725,12 @@ def _mean_or_none(values: Sequence[float | None]) -> float | None:
 
 
 def rotation_indicators(
-    ranked: RankedRotation, protection: SoilProtection
+    ranked: RankedRotation, protection: SoilProtection, revenue_ceiling: float | None
 ) -> dict[str, float | None]:
-    """Unrounded absolute 0–100 indicators (worse crop for productivity and water security)."""
+    """Unrounded absolute 0–100 indicators (worse crop for productivity and water security).
+
+    `revenue_ceiling` is the gross revenue scored 100 (see `candidates_revenue_ceiling`).
+    """
     risks = [rotation_crop.crop.risk for rotation_crop in ranked.crops]
     return {
         "productivity": _worst(
@@ -740,13 +745,24 @@ def rotation_indicators(
             [None if risk.risk_percentage is None else 100 - risk.risk_percentage for risk in risks]
         ),
         "soil_protection": exact_value(protection),
-        "revenue": _revenue_score(ranked.crops),
+        "revenue": _revenue_score(ranked.crops, revenue_ceiling),
     }
 
 
-def _revenue_score(crops: Sequence[RotationCrop]) -> float | None:
+def candidates_revenue_ceiling(candidates: Iterable[RankedRotation]) -> float | None:
+    """Best gross revenue (no water loss) among the site's viable rotations; scores 100."""
+    return revenue_ceiling(
+        [rotation_crop.economics for rotation_crop in ranked.crops] for ranked in candidates
+    )
+
+
+def _revenue_score(crops: Sequence[RotationCrop], ceiling: float | None) -> float | None:
+    """Water-adjusted revenue over the ceiling × 100, capped at 100 (a custom rotation may be a
+    non-viable pair that earns more than the ceiling)."""
     revenue = _water_adjusted_revenue(crops)
-    return None if revenue is None else min(100.0, revenue / revenue_scale_max() * 100)
+    if revenue is None or ceiling is None or ceiling <= 0:
+        return None
+    return min(100.0, revenue / ceiling * 100)
 
 
 def rotation_scores(indicators: Mapping[str, float | None]) -> RotationScores:
@@ -778,15 +794,22 @@ def select_rotations(
     priorities: Priorities,
     history_families: Sequence[str],
     agricultural_year: int,
+    revenue_ceiling: float | None,
 ) -> list[ScoredRotation]:
     """Best planting date of every crop pair by the priorities, sorted from best."""
-    scored = [score_rotation(ranked, history_families, agricultural_year) for ranked in candidates]
+    scored = [
+        score_rotation(ranked, history_families, agricultural_year, revenue_ceiling)
+        for ranked in candidates
+    ]
     scored.sort(key=lambda item: _priority_key(item, priorities))
     return _best_per_pair(scored)
 
 
 def score_rotation(
-    ranked: RankedRotation, history_families: Sequence[str], agricultural_year: int
+    ranked: RankedRotation,
+    history_families: Sequence[str],
+    agricultural_year: int,
+    revenue_ceiling: float | None,
 ) -> ScoredRotation:
     """Soil protection, indicators and displayed scores of one simulated rotation."""
     protection = rotation_soil_protection(
@@ -795,7 +818,7 @@ def score_rotation(
         date(agricultural_year, *SEASON_START),
         date(agricultural_year + 1, *SEASON_END),
     )
-    indicators = rotation_indicators(ranked, protection)
+    indicators = rotation_indicators(ranked, protection, revenue_ceiling)
     return ScoredRotation(ranked, protection, rotation_scores(indicators), indicators)
 
 
@@ -933,6 +956,7 @@ class RankingContext:
     climate: _Climate
     season_years: Sequence[int]
     previous_families: list[str]
+    revenue_ceiling: float | None  # gross revenue scored 100: best viable rotation, no loss
     ranked: list[ScoredRotation]  # best planting date of each crop pair, best first
 
 
@@ -973,7 +997,8 @@ def ranking_context(
         )
         _ranking_cache.put(cache_key, candidates)
     # Priorities and crop_history only re-score the cached candidates (no new simulation).
-    ranked = select_rotations(candidates, request.priorities, previous_families, year)
+    ceiling = candidates_revenue_ceiling(candidates)
+    ranked = select_rotations(candidates, request.priorities, previous_families, year, ceiling)
     return RankingContext(
         year=year,
         soil=soil,
@@ -983,6 +1008,7 @@ def ranking_context(
         climate=_Climate(climate_days),
         season_years=season_years,
         previous_families=previous_families,
+        revenue_ceiling=ceiling,
         ranked=ranked,
     )
 
@@ -1048,6 +1074,10 @@ def _assumptions() -> RotationAssumptions:
     )
 
 
+def scenario_info(scenario_id: str) -> ClimateScenarioInfo:
+    return ClimateScenarioInfo(**asdict(SCENARIOS[scenario_id]))
+
+
 def recommendations(
     repository: CropRepository,
     request: RotationRequest,
@@ -1081,6 +1111,7 @@ def recommendations(
 
     return RotationRecommendationsResponse(
         agricultural_year=context.year,
+        climate_scenario=scenario_info(request.climate_scenario),
         soil_type=context.soil.texture_class,
         soil=context.soil,
         soil_properties=soil_properties,
@@ -1326,7 +1357,12 @@ def custom_rotation(
     context: RankingContext, plan: CustomPlan, priorities: Priorities
 ) -> CustomRotation:
     """Simulate a custom rotation and place it among the recommended ones."""
-    scored = score_rotation(evaluate_plan(context, plan), context.previous_families, context.year)
+    scored = score_rotation(
+        evaluate_plan(context, plan),
+        context.previous_families,
+        context.year,
+        context.revenue_ceiling,
+    )
     rank = rank_position(scored, context.ranked, priorities)
     codes = "-".join(str(code) for code in plan.crop_codes)
     return CustomRotation(
@@ -1416,7 +1452,10 @@ def planting_sweep(
         if candidate.last_harvest > season_end:
             continue
         scored = score_rotation(
-            evaluate_plan(context, candidate, shared), context.previous_families, context.year
+            evaluate_plan(context, candidate, shared),
+            context.previous_families,
+            context.year,
+            context.revenue_ceiling,
         )
         index = decendio_idx(start)
         points.append(
@@ -1458,6 +1497,7 @@ def simulate_rotation(
     priorities = request.priorities
     return RotationSimulationResponse(
         agricultural_year=context.year,
+        climate_scenario=scenario_info(request.climate_scenario),
         soil_type=context.soil.texture_class,
         soil=context.soil,
         priorities=priorities,

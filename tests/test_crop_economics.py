@@ -4,7 +4,7 @@ import pytest
 
 from app.services.crop_economics import (
     load_crop_economics,
-    revenue_scale_max,
+    revenue_ceiling,
     rotation_gross_revenue,
     water_adjusted_revenue,
 )
@@ -97,9 +97,23 @@ def test_latest_pinksheet_skips_missing_values_and_drops_stale_series() -> None:
     assert latest_pinksheet(periods, ["…", "…", float("nan")], "2025M12") is None
 
 
-def test_revenue_scale_max_is_the_two_best_crops() -> None:
-    revenues = sorted(item.gross_revenue_usd_ha for item in load_crop_economics().values())
-    assert revenue_scale_max() == pytest.approx(revenues[-1] + revenues[-2])
+def test_revenue_ceiling_is_the_best_rotation_without_loss() -> None:
+    economics = load_crop_economics()
+    soy, maize = economics[ROTATION_CROP_CODES[0]], economics[ROTATION_CROP_CODES[1]]
+    sorghum = economics[SORGHUM]
+    pairs = [(soy, maize), (soy, sorghum), (maize, None)]
+    expected = max(
+        soy.gross_revenue_usd_ha + maize.gross_revenue_usd_ha,
+        soy.gross_revenue_usd_ha + sorghum.gross_revenue_usd_ha,
+    )
+    assert revenue_ceiling(pairs) == pytest.approx(expected, abs=0.05)
+    assert revenue_ceiling([(soy,)]) == pytest.approx(soy.gross_revenue_usd_ha, abs=0.05)
+
+
+def test_revenue_ceiling_is_none_without_rotations_with_data() -> None:
+    economics = load_crop_economics()
+    assert revenue_ceiling([]) is None
+    assert revenue_ceiling([(economics[SORGHUM], None)]) is None
 
 
 def test_water_adjusted_revenue_discounts_each_crop() -> None:

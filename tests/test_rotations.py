@@ -4,6 +4,7 @@ API tests run the real ranking on the Sorriso POWER seed (app/data/power), with 
 """
 
 import asyncio
+import statistics
 import time
 from collections.abc import Iterator
 from dataclasses import replace
@@ -23,7 +24,7 @@ from app.services import power_client as pc
 from app.services import rotations as rotations_service
 from app.services.agro import DiaClima
 from app.services.crop_calendar import apply_calendar, crop_calendars, scale_stage_lengths
-from app.services.crop_economics import revenue_scale_max
+from app.services.crop_economics import load_crop_economics
 from app.services.ecocrop import get_repository
 from app.services.rotations import (
     COMMON_BEAN,
@@ -36,6 +37,7 @@ from app.services.rotations import (
     SORGHUM,
     SOYBEAN,
     RankedRotation,
+    candidates_revenue_ceiling,
     crop_risk,
     evaluate_rotation,
     first_planting_dates,
@@ -955,10 +957,16 @@ def soy_maize(crops, wet_days) -> RankedRotation:
     )
 
 
-def _indicators(soy_maize, risk_a: CropRisk, risk_b: CropRisk) -> dict:
+# Gross revenue scored 100 in the unit tests (the API takes it from the site's candidates).
+REVENUE_CEILING = 10_000.0
+
+
+def _indicators(
+    soy_maize, risk_a: CropRisk, risk_b: CropRisk, ceiling: float | None = REVENUE_CEILING
+) -> dict:
     ranked = _with_risks(soy_maize, risk_a, risk_b, date(2027, 10, 1))
     protection = rotation_soil_protection(ranked, [], date(2027, 9, 1), date(2028, 8, 31))
-    return rotation_indicators(ranked, protection)
+    return rotation_indicators(ranked, protection, ceiling)
 
 
 def test_scores_take_the_worse_crop_and_overall_averages_all_three(soy_maize) -> None:
@@ -1006,9 +1014,10 @@ def test_best_planting_date_of_a_pair_follows_the_priorities(soy_maize) -> None:
     )
     candidates = [unknown, late, early]
 
-    [by_risk] = select_rotations(candidates, Priorities(**OFF), [], 2027)
+    [by_risk] = select_rotations(candidates, Priorities(**OFF), [], 2027, REVENUE_CEILING)
     assert by_risk.ranked.first.planting_date == date(2027, 10, 1)
-    [by_yield] = select_rotations(candidates, Priorities(**{**OFF, "productivity": 1}), [], 2027)
+    by_yield_priorities = Priorities(**{**OFF, "productivity": 1})
+    [by_yield] = select_rotations(candidates, by_yield_priorities, [], 2027, REVENUE_CEILING)
     assert by_yield.ranked.first.planting_date == date(2027, 10, 11)
 
 
@@ -1319,14 +1328,21 @@ def _expected_revenue(rotation: dict) -> float:
     )
 
 
-def test_revenue_score_is_water_adjusted_revenue_over_the_catalog_ceiling(body: dict) -> None:
+def test_revenue_score_is_water_adjusted_revenue_over_the_best_viable_rotation(body: dict) -> None:
+    ceilings = []
     for rotation in body["rotations"]:
         adjusted = rotation["water_adjusted_revenue_usd_ha"]
         assert adjusted == pytest.approx(_expected_revenue(rotation), abs=0.1)
         assert adjusted <= rotation["gross_revenue_usd_ha"]
-        assert rotation["scores"]["revenue"] == pytest.approx(
-            adjusted / revenue_scale_max() * 100, abs=0.05
-        )
+        assert 0 < rotation["scores"]["revenue"] <= 100
+        ceilings.append(adjusted / rotation["scores"]["revenue"] * 100)
+    # One ceiling for every rotation, at least the best gross revenue among them (the ceiling
+    # comes from every viable pair, not only the returned ones), never the catalog's best two.
+    ceiling = statistics.fmean(ceilings)
+    assert all(value == pytest.approx(ceiling, rel=2e-3) for value in ceilings)
+    assert ceiling >= max(r["gross_revenue_usd_ha"] for r in body["rotations"]) * (1 - 2e-3)
+    catalog = sorted(item.gross_revenue_usd_ha for item in load_crop_economics().values())
+    assert ceiling <= catalog[-1] + catalog[-2]
     assert not any("revenue priority" in warning for warning in body["warnings"])
 
 
@@ -1341,7 +1357,7 @@ def test_revenue_priority_ranks_by_revenue_and_warns(client: TestClient) -> None
 def test_revenue_indicator_discounts_each_crop_by_its_water_loss(soy_maize) -> None:
     indicators = _indicators(soy_maize, _risk(10.0, 0.0, 0.95), _risk(20.0, 10.0, 0.97))
     soy, maize = (rc.economics.gross_revenue_usd_ha for rc in soy_maize.crops)
-    expected = (soy * 0.9 + maize * 0.8) / revenue_scale_max() * 100
+    expected = (soy * 0.9 + maize * 0.8) / REVENUE_CEILING * 100
     assert indicators["revenue"] == pytest.approx(expected)
     only_revenue = Priorities(**OFF, revenue=1)
     assert priority_value(indicators, only_revenue) == pytest.approx(expected)
@@ -1357,6 +1373,29 @@ def test_unknown_loss_gives_no_revenue_score(soy_maize) -> None:
     assert rotation_scores(indicators).revenue is None
 
 
+def test_revenue_ceiling_comes_from_the_viable_candidates(soy_maize) -> None:
+    soy, maize = (rc.economics.gross_revenue_usd_ha for rc in soy_maize.crops)
+    ceiling = candidates_revenue_ceiling([soy_maize])
+    assert ceiling == pytest.approx(soy + maize, abs=0.05)
+    catalog = sorted(item.gross_revenue_usd_ha for item in load_crop_economics().values())
+    assert ceiling < catalog[-1] + catalog[-2]  # non-viable pairs do not raise it
+    assert candidates_revenue_ceiling([]) is None
+
+
+def test_best_viable_rotation_with_no_loss_scores_100(soy_maize) -> None:
+    ceiling = candidates_revenue_ceiling([soy_maize])
+    no_loss = _indicators(soy_maize, _risk(0.0, 0.0, 1.0), _risk(0.0, 0.0, 1.0), ceiling)
+    assert no_loss["revenue"] == pytest.approx(100.0, abs=0.01)
+    # A custom rotation earning more than the ceiling is capped.
+    capped = _indicators(soy_maize, _risk(0.0, 0.0, 1.0), _risk(0.0, 0.0, 1.0), 1.0)
+    assert capped["revenue"] == 100.0
+
+
+def test_no_viable_rotation_gives_no_revenue_score(soy_maize) -> None:
+    indicators = _indicators(soy_maize, _risk(0.0, 0.0, 1.0), _risk(0.0, 0.0, 1.0), None)
+    assert indicators["revenue"] is None
+
+
 def test_planting_sweep_best_follows_the_revenue_priority(client: TestClient) -> None:
     simulated = _simulate(
         client, {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]}, priorities={**OFF, "revenue": 1}
@@ -1366,3 +1405,45 @@ def test_planting_sweep_best_follows_the_revenue_priority(client: TestClient) ->
     revenue = [p["scores"]["revenue"] for p in points.values()]
     assert None not in revenue
     assert points[sweep["best_decendio_idx"]]["scores"]["revenue"] == max(revenue)
+
+
+# --- Climate scenarios (delta method) --------------------------------------------------------
+
+
+def test_default_climate_scenario_is_historical(body: dict) -> None:
+    assert body["climate_scenario"]["id"] == "historical"
+    assert body["climate_scenario"]["delta_temp_c"] == 0
+
+
+def test_unknown_climate_scenario_is_rejected(client: TestClient) -> None:
+    resp = client.post(URL, json={**BODY, "climate_scenario": "apocalypse"})
+    assert resp.status_code == 422
+
+
+def test_warmer_drier_scenario_does_not_lower_the_water_loss(client: TestClient) -> None:
+    rotation = {"crops": [{"code": SOYBEAN}, {"code": MAIZE}]}
+    current = _simulate(client, rotation, sweep=False)
+    future = _simulate(client, rotation, sweep=False, climate_scenario="warmer_drier")
+    assert current["climate_scenario"]["id"] == "historical"
+    assert future["climate_scenario"]["id"] == "warmer_drier"
+    losses = [
+        (
+            now["crop"]["risk"]["estimated_yield_loss_pct"],
+            then["crop"]["risk"]["estimated_yield_loss_pct"],
+        )
+        for now, then in zip(current["rotation"]["crops"], future["rotation"]["crops"], strict=True)
+    ]
+    assert all(then >= now for now, then in losses)
+    assert any(then > now for now, then in losses)
+
+
+def test_scenario_recommendations_are_cached_apart_from_historical(
+    client: TestClient, body: dict
+) -> None:
+    future = client.post(
+        URL, json={**BODY, "agricultural_year": 2027, "climate_scenario": "warmer_drier"}
+    ).json()
+    again = client.post(URL, json={**BODY, "agricultural_year": 2027}).json()
+    assert future["climate_scenario"]["id"] == "warmer_drier"
+    assert again["rotations"] == body["rotations"]
+    assert future["rotations"] != body["rotations"]

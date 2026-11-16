@@ -31,11 +31,16 @@ def rotation_gross_revenue(economics: Iterable[CropEconomics | None]) -> float |
     return round(sum(item.gross_revenue_usd_ha for item in values), 1)
 
 
-@cache
-def revenue_scale_max() -> float:
-    """Ceiling of the revenue score: the two highest crop revenues of the catalog, no loss."""
-    revenues = sorted(item.gross_revenue_usd_ha for item in load_crop_economics().values())
-    return sum(revenues[-2:])
+def revenue_ceiling(rotations: Iterable[Iterable[CropEconomics | None]]) -> float | None:
+    """Ceiling of the revenue score: the highest gross revenue (no loss) among the rotations.
+
+    Given the viable rotations of a site, 100 is the best of them with no water-limited loss.
+    Rotations with a crop without economics are skipped; None when none is left.
+    """
+    revenues = [
+        revenue for crops in rotations if (revenue := rotation_gross_revenue(crops)) is not None
+    ]
+    return max(revenues, default=None)
 
 
 def water_adjusted_revenue(

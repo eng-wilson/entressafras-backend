@@ -149,3 +149,12 @@ def test_power_indisponivel_503(tmp_path) -> None:
     finally:
         app.dependency_overrides.clear()
     assert resp.status_code == 503
+
+
+def test_scenarios_lists_presets_with_historical_first(client: TestClient) -> None:
+    resp = client.get("/api/clima/scenarios")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [s["id"] for s in body] == ["historical", "warmer", "warmer_drier"]
+    assert body[0]["delta_temp_c"] == 0 and body[0]["rain_change_pct"] == 0
+    assert all(s["source"] and s["description"] for s in body)

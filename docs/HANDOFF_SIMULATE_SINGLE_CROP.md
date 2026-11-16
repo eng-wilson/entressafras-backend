@@ -227,7 +227,7 @@ estes campos.
 | `crops[].economics` | Preço ao produtor (US$/t), produtividade (kg/ha) e `gross_revenue_usd_ha` da cultura, média do Brasil (FAOSTAT, 3 últimos anos). Cada valor traz `source`, `series`, `period`, `area`, `url` e `method` (`direct` ou `proxy`: milheto e caupi). `international_price` (Banco Mundial) quando existe. `null` para culturas fora do catálogo de rotação. |
 | `rotation.gross_revenue_usd_ha` | Soma do faturamento de referência das culturas, sem custos. |
 | `rotation.water_adjusted_revenue_usd_ha` | Mesmo valor, com cada cultura descontada pela sua `estimated_yield_loss_pct` no local. |
-| `scores.revenue` | `water_adjusted_revenue_usd_ha` ÷ teto × 100. Teto = as duas culturas de maior faturamento do catálogo sem perda (hoje algodão + amendoim, ~US$ 5.876/ha). Sempre preenchido, mesmo com a prioridade desligada; `null` se faltar dado. Também aparece em `points[].scores` da varredura. |
+| `scores.revenue` | `water_adjusted_revenue_usd_ha` ÷ teto × 100. Teto = maior faturamento bruto, sem perda, entre as rotações viáveis no local (o mesmo para as recomendações, a rotação simulada e a varredura); limitado a 100. Sempre preenchido, mesmo com a prioridade desligada; `null` se faltar dado. Também aparece em `points[].scores` da varredura. |
 | `scores.overall` | Continua a média de productivity, water_security e soil_protection; **não** inclui revenue. |
 | `warnings` | Com `revenue: 1`, inclui o aviso de que é uma estimativa nacional, sem custos, e que a perda hídrica pesa duas vezes se `productivity` também estiver ligada. |
 

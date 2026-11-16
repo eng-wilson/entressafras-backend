@@ -114,11 +114,26 @@ produtividade e o faturamento bruto de referência (produtividade/1000 × preço
 - É uma média nacional, não previsão para a fazenda: não aplica o risco hídrico do local (a média já
   embute perdas típicas) e não desconta custos de produção.
 - **Prioridade `revenue`** (opcional, desligada por padrão): ordena pela soma do faturamento de cada
-  cultura × (1 − perda hídrica estimada no local). A nota 0–100 usa como teto as duas culturas de
-  maior faturamento do arquivo sem perda (hoje algodão + amendoim, ~US$ 5.876/ha); ao regenerar o
-  arquivo, o teto acompanha. Não entra em `overall`.
+  cultura × (1 − perda hídrica estimada no local). A nota 0–100 usa como teto o maior faturamento
+  bruto, sem perda, entre as rotações viáveis no local (família, calendário e temperatura). O teto
+  muda de local para local, e a melhor rotação só chega a 100 se não tiver perda hídrica. Não entra
+  em `overall`.
 - O link do Pink Sheet muda a cada ano (id do documento); pegue o atual em worldbank.org/commodities
   e passe em `--pinksheet-url`.
 
 Licença CC BY 4.0 (FAOSTAT e World Bank). Cite: FAO. FAOSTAT: Producer Prices; Crops and livestock
 products. Rome. https://www.fao.org/faostat/ — e World Bank. Commodity Price Data (The Pink Sheet).
+
+# Cenários de clima futuro (`app/services/climate_scenario.py`)
+
+Não há arquivo de dados: os cenários são deltas aplicados à série do NASA POWER pelo método delta
+(*change factor*). Tmax e Tmin recebem +ΔT, a chuva é multiplicada por (1 + Δ%) e, se pedido, a chuva
+de 15/ago a 31/dez é deslocada N dias para frente (atraso no início das chuvas). A ET0 é recalculada
+com a mesma rotina FAO-56; ponto de orvalho e umidade relativa ficam iguais.
+
+- **Valores atuais: ilustrativos** (`warmer` +1,0 °C; `warmer_drier` +1,5 °C, −10 % de chuva, 10 dias
+  de atraso). Ainda precisam ser substituídos pela média multimodelo do NASA NEX-GDDP-CMIP6 (ou do
+  IPCC WGI Interactive Atlas), SSP2-4.5, 2021–2040 em relação a 1995–2014, região Centro-Oeste.
+- Referência do método: IPCC TGICA (2007), *General Guidelines on the Use of Scenario Data for Climate
+  Impact and Adaptation Assessment*, v2, seção sobre o método delta.
+- São cenários "e se", não uma previsão da próxima safra.

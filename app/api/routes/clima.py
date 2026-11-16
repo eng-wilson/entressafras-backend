@@ -11,11 +11,13 @@ from app.schemas.clima import (
     Celula,
     ClimaDecendios,
     ClimaDiario,
+    ClimateScenarioInfo,
     Decendio,
     Dia,
     Ponto,
 )
 from app.services.agro import agregar_decendios, mesclar_smap
+from app.services.climate_scenario import SCENARIOS
 from app.services.power_client import (
     Janela,
     PowerClient,
@@ -124,3 +126,13 @@ async def clima_diario(
         celula=_celula(serie),
         dias=[Dia(**asdict(d)) for d in serie.dias if inicio <= d.data <= fim],
     )
+
+
+@router.get("/scenarios", response_model=list[ClimateScenarioInfo])
+async def climate_scenarios() -> list[ClimateScenarioInfo]:
+    """Climate scenarios accepted by `climate_scenario` in /rotations (delta method).
+
+    `historical` is the observed record; the others perturb it (+°C, rainfall change, later
+    rainy season onset). They are "what if" scenarios, not a forecast of the next season.
+    """
+    return [ClimateScenarioInfo(**asdict(scenario)) for scenario in SCENARIOS.values()]

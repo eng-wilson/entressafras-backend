@@ -9,7 +9,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.schemas.clima import ClimateScenarioInfo
 from app.schemas.crop import CropDetail, CropEconomics
+from app.services.climate_scenario import ScenarioId
 from app.services.soil import SoilType
 
 RiskMethod = Literal["FAO56_SIMPLIFIED_KY"]
@@ -119,6 +121,13 @@ class RotationContext(BaseModel):
         description=(
             "Indicators that rank the rotations (0 = off, 1 = on); the three agronomic ones are "
             "on by default, revenue is off"
+        ),
+    )
+    climate_scenario: ScenarioId = Field(
+        "historical",
+        description=(
+            "Climate the seasons are simulated with: the observed record (default) or a future "
+            "scenario applied to it by the delta method (see GET /clima/scenarios)"
         ),
     )
 
@@ -277,9 +286,10 @@ class RotationScores(BaseModel):
     revenue: float | None = Field(
         description=(
             "Σ crop reference gross revenue × (1 − estimated_yield_loss_pct/100), over the "
-            "catalog's best pair at no loss (the two highest crop revenues) × 100: 0 = no revenue, "
-            "100 = that pair with no water-limited loss. Null when a crop has no economics or "
-            "an unknown risk"
+            "highest gross revenue among the viable rotations at this site × 100: 0 = no "
+            "revenue, 100 = the best viable rotation with no water-limited loss (capped at 100). "
+            "Null when a crop has no economics, an unknown risk, or the site has no viable "
+            "rotation"
         )
     )
     overall: float | None = Field(
@@ -441,6 +451,7 @@ class SoilProperties(BaseModel):
 
 class RotationRecommendationsResponse(BaseModel):
     agricultural_year: int
+    climate_scenario: ClimateScenarioInfo
     soil_type: SoilType
     soil: SoilInfo
     soil_properties: SoilProperties | None = Field(
@@ -457,6 +468,7 @@ class RotationRecommendationsResponse(BaseModel):
 
 class RotationSimulationResponse(BaseModel):
     agricultural_year: int
+    climate_scenario: ClimateScenarioInfo
     soil_type: SoilType
     soil: SoilInfo
     priorities: Priorities
